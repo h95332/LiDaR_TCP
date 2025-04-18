@@ -370,7 +370,7 @@ class PointCloudViewer:
                     stamps = np.full((pts.shape[0], 1),
                                     time.time(),
                                     dtype=np.float32)
-                    data4 = np.hstack((pts, stamps))
+                    data4 = np.hstack((pts, stamps)) 
 
                 # 拆出 XYZ bytes
                  # 傳送 x,y,z,timestamp
