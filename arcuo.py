@@ -543,7 +543,7 @@ class PointCloudViewer:
         view = pyrr.matrix44.create_look_at(eye, target, np.array([0.0, 1.0, 0.0], dtype=np.float32))
         # 建立模型矩陣（旋轉）
         pitch = pyrr.matrix44.create_from_x_rotation(self.rotation_x)
-        yaw   = pyrr.matrix44.create_from_z_rotation(self.rotation_y)
+        yaw   = pyrr.matrix44.create_from_z_rotation(self.rotation_y) 
         model = pyrr.matrix44.multiply(yaw, pitch)
         # 計算 MVP 矩陣
         MVP = pyrr.matrix44.multiply(model, view)
