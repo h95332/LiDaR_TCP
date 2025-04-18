@@ -324,42 +324,88 @@ class PointCloudViewer:
         self.use_live_data = True          # True ➜ 即時模式；False ➜ 載入檔案模式
         self.loaded_points = np.empty((0, 3), dtype=np.float32)
         self.loaded_poses  = {}            # 儲存 camera/lidar/world 4×4
+        self.loaded_points = np.empty((0, 4), dtype=np.float32)  # x,y,z,timestamp
+        self.loaded_poses  = {}
+
+        # 新增：檔案模式時間範圍與滑桿參數
+        self.file_time_min   = 0.0
+        self.file_time_max   = 0.0
+        self.file_time_start = 0.0
+        self.file_time_end   = 0.0
+
     
 
     def tcp_sender(self, host, port):
-        try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.connect((host, port))
-            print(f"TCP Sender: 連線到 {host}:{port}")
-        except Exception as e:
-            print(f"TCP Sender 無法連線: {e}")
-            return
+        import socket, time, struct, json
+        import numpy as np
 
         while True:
-            with self.points_lock:
-                raw_points = self.ring_buffer.get_recent_points(self.retention_seconds)
-                transformed = transform_point_cloud(raw_points, self.Lidar_T_Aruco)  # or any matrix you want
-                points_bin = transformed.astype(np.float32).tobytes()
-
-            # ✅ 使用自訂編碼器處理 numpy 物件
-            coord_system = {
-                "lidar":  self.Lidar_Position,
-                "camera": self.Camera_Position,
-                "world":  self.Word_Point
-            }
-            coord_json = json.dumps(coord_system, cls=NumpyEncoder)
-            coord_bin = coord_json.encode('utf-8')
-
-            header = struct.pack('<II', len(coord_bin), len(points_bin))
-            message = header + coord_bin + points_bin
-
+            # 嘗試連線
             try:
-                sock.sendall(message)
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.connect((host, port))
+                print(f"TCP Sender: 已連線至 {host}:{port}")
             except Exception as e:
-                print(f"TCP Sender 傳送錯誤: {e}")
-                break
+                print(f"TCP Sender 無法連線: {e}，2 秒後重試…")
+                time.sleep(2)
+                continue
 
-            time.sleep(self.retention_seconds)
+            # 連線成功後持續送資料
+            while True:
+                # ► 準備要送的點雲資料（live / 檔案模式分支）
+                if self.use_live_data:
+                    with self.points_lock:
+                        pts = self.ring_buffer.get_recent_points(self.retention_seconds)
+                    data3 = transform_point_cloud(pts, self.Lidar_T_Aruco)
+                    stamps = np.full((data3.shape[0], 1), time.time(), dtype=np.float32)
+                    data4 = np.hstack((data3, stamps))
+                else:
+                    # 先篩出 xyz（不含舊的 timestamp）
+                    mask = np.logical_and(
+                        self.loaded_points[:,3] >= self.file_time_start,
+                        self.loaded_points[:,3] <= self.file_time_end
+                    )
+                    pts = self.loaded_points[mask, :3].astype(np.float32)
+                    # 用現在系統時間取代所有 timestamp
+                    stamps = np.full((pts.shape[0], 1),
+                                    time.time(),
+                                    dtype=np.float32)
+                    data4 = np.hstack((pts, stamps))
+
+                # 拆出 XYZ bytes
+                 # 傳送 x,y,z,timestamp
+                points_bin = data4.astype(np.float32).tobytes()
+
+                # 組裝座標系 JSON
+                coord_system = {
+                    "lidar":  self.Lidar_Position,
+                    "camera": self.Camera_Position,
+                    "world":  self.Word_Point
+                }
+                coord_bin = json.dumps(coord_system, cls=NumpyEncoder).encode('utf-8')
+
+                # Header：coord 長度 + points 長度
+                header = struct.pack('<II', len(coord_bin), len(points_bin))
+                message = header + coord_bin + points_bin
+
+                # 傳送
+                try:
+                    sock.sendall(message)
+                except Exception as e:
+                    print(f"TCP Sender 傳送錯誤: {e}，將重新建立連線…")
+                    break
+
+                # 間隔 self.retention_seconds 秒
+                time.sleep(1)
+
+            # 若內層迴圈因錯誤跳出，關閉 socket、2 秒後再重連
+            try:
+                sock.close()
+            except:
+                pass
+            print("TCP 連線已關閉，2 秒後嘗試重連…")
+            time.sleep(2)
+
 
 
 
@@ -574,8 +620,14 @@ class PointCloudViewer:
             self.Lidar_Position  = self.Camera_Position @ Cam_T_Lidar
         else:
             # ► 檔案模式：顯示已載入的點雲與姿態，完全不動用 ArUco
-            pts_array = self.loaded_points.astype(np.float32)
-            total_pts = pts_array.shape[0]
+            # 檔案模式：依滑桿過濾 timestamp
+            mask   = np.logical_and(
+                self.loaded_points[:,3] >= self.file_time_start,
+                self.loaded_points[:,3] <= self.file_time_end
+            )
+            pts3d    = self.loaded_points[mask, :3].astype(np.float32)
+            pts_array = pts3d
+            total_pts = self.loaded_points.shape[0]
             # 直接用 PLY 裡的三組 4×4 矩陣
             self.Word_Point      = self.loaded_poses.get("world",  np.eye(4, dtype=np.float32))
             self.Camera_Position = self.loaded_poses.get("camera", np.eye(4, dtype=np.float32))
@@ -662,6 +714,26 @@ class PointCloudViewer:
                 with global_transform_lock:
                     global_transform[:] = latest_transform_matrix.copy()
             print("✅ 已套用最新 ArUco 位置至 global_transform")
+        if not self.use_live_data:
+            # 只有載入的檔案真的有 time 才顯示滑桿
+            if self.file_time_max > self.file_time_min:
+                _, self.file_time_start = imgui.slider_float(
+                    "Start Time",
+                    self.file_time_start,
+                    self.file_time_min,
+                    self.file_time_end
+                )
+                _, self.file_time_end   = imgui.slider_float(
+                    "  End Time",
+                    self.file_time_end,
+                    self.file_time_start,
+                    self.file_time_max
+                )
+            else:
+                # 無 timestamp 時顯示提示文字
+                imgui.text("(This file does not have a timestamp)")
+
+
         imgui.text(f"Current points: {pts_array.shape[0]}")
         imgui.text(f"Total stored: {total_pts}")
         imgui.end()
@@ -693,53 +765,53 @@ class PointCloudViewer:
 
     def save_points_to_ply(self):
         with self.points_lock:
-            raw_points = self.ring_buffer.get_recent_points(self.retention_seconds)
-
-        if raw_points.size == 0:
+            raw = self.ring_buffer.buffer[:self.ring_buffer.size].copy()
+        if raw.size == 0:
             print("沒有可儲存的點雲資料")
             return
 
-        # 套用當前姿態轉換
+        # 套用當前 ArUco 轉換
         with global_transform_lock:
             Camera_T_Aruco = global_transform.copy()
         Lidar_T_Aruco = np.linalg.inv(Cam_T_Lidar) @ Camera_T_Aruco
-        transformed = transform_point_cloud(raw_points, Lidar_T_Aruco)
 
-        # 儲存的姿態矩陣
-        camera_pose = np.linalg.inv(Camera_T_Aruco)
-        lidar_pose = camera_pose @ Cam_T_Lidar
-        world_pose = np.eye(4, dtype=np.float32)
+        # 先轉 XYZ，再把 timestamp 併回
+        pts_xyz = transform_point_cloud(raw[:, :3], Lidar_T_Aruco)
+        ts      = raw[:, 3].reshape(-1,1).astype(np.float32)
+        data4   = np.hstack((pts_xyz, ts))  # shape=(N,4)
 
-        # ✅ 建立資料夾
-        save_dir = "saved_ply"
-        os.makedirs(save_dir, exist_ok=True)
-
-        filename = os.path.join(save_dir, f"pointcloud_{time.strftime('%Y%m%d_%H%M%S')}_with_pose.ply")
-
-        # 建立 PLY header + comment 標記姿態資訊
+        # PLY header，新增 timestamp 屬性
         header_lines = [
             "ply",
             "format binary_little_endian 1.0",
-            f"element vertex {len(transformed)}",
+            f"element vertex {len(data4)}",
             "property float x",
             "property float y",
             "property float z",
+            "property float timestamp",
         ]
-
+        # 把相機/雷射/世界 pose 當 comment 寫入
         def matrix_to_comments(name, mat):
             flat = mat.flatten()
             return [f"comment {name}_{i} {v:.6f}" for i, v in enumerate(flat)]
-
+        camera_pose = np.linalg.inv(Camera_T_Aruco)
+        lidar_pose  = camera_pose @ Cam_T_Lidar
+        world_pose  = np.eye(4, dtype=np.float32)
         header_lines += matrix_to_comments("camera", camera_pose)
-        header_lines += matrix_to_comments("lidar", lidar_pose)
-        header_lines += matrix_to_comments("world", world_pose)
+        header_lines += matrix_to_comments("lidar",  lidar_pose)
+        header_lines += matrix_to_comments("world",  world_pose)
         header_lines.append("end_header")
         header = "\n".join(header_lines) + "\n"
 
-        # 啟動儲存執行緒
-        threading.Thread(target=self.save_points_to_ply_binary_task,
-                        args=(transformed, filename, header),
-                        daemon=True).start()
+        # 寫檔執行緒
+        threading.Thread(
+            target=self.save_points_to_ply_binary_task,
+            args=(data4, os.path.join("saved_ply",
+                                    f"pointcloud_{time.strftime('%Y%m%d_%H%M%S')}_with_pose.ply"),
+                header),
+            daemon=True
+        ).start()
+
 
  # -------------------------
 # 額外：繪製 ArUco、Camera、LiDAR 的動態坐標系（XYZ）
@@ -784,7 +856,6 @@ class PointCloudViewer:
         glDeleteBuffers(1, [vbo])
         glLineWidth(1.0)
 
-    # 放在 PointCloudViewer 類別內其他方法之後
     def load_ply_with_pose(self, filepath: str):
         if not os.path.exists(filepath):
             messagebox.showerror("錯誤", f"找不到檔案：{filepath}")
@@ -792,31 +863,71 @@ class PointCloudViewer:
 
         with open(filepath, 'rb') as f:
             header = []
+            properties = []
             while True:
                 line = f.readline().decode('utf-8').strip()
                 header.append(line)
+                # 收集所有 property float <name>
+                if line.startswith("property"):
+                    parts = line.split()
+                    if len(parts) == 3 and parts[1] == "float":
+                        properties.append(parts[2])
                 if line == "end_header":
                     break
 
-            # 取得頂點數
-            vertex_cnt = next(int(l.split()[-1]) for l in header if l.startswith("element vertex"))
+            # 讀頂點數
+            vertex_cnt = next(int(l.split()[-1])
+                            for l in header if l.startswith("element vertex"))
 
-            # 解析 comment 中的姿態
-            poses = {"camera": [0.0]*16, "lidar": [0.0]*16, "world": [0.0]*16}
+            # 解析 poses（不變）
+            poses = {"camera":[0]*16, "lidar":[0]*16, "world":[0]*16}
             for l in header:
                 if l.startswith("comment"):
                     _, tag, val = l.split()
                     name, idx = tag.split("_")
                     poses[name][int(idx)] = float(val)
+            self.loaded_poses = {
+                k: np.array(v, dtype=np.float32).reshape(4,4)
+                for k,v in poses.items()
+            }
 
-            self.loaded_poses = {k: np.array(v, dtype=np.float32).reshape(4,4) for k, v in poses.items()}
+            # 根據 property 數量動態讀取 data
+            prop_cnt = len(properties)  # 3 或 4
+            raw = np.fromfile(f, dtype=np.float32, count=vertex_cnt * prop_cnt)
+            pts = raw.reshape(-1, prop_cnt)
 
-            # 讀取點雲本體
-            raw = np.fromfile(f, dtype=np.float32, count=vertex_cnt*3)
-            self.loaded_points = raw.reshape(-1, 3)
+            # 如果只有 x,y,z，就補一欄 timestamp=0
+            if prop_cnt == 3 or "timestamp" not in properties:
+                xyz = pts[:, :3]
+                t   = np.zeros((vertex_cnt,1), dtype=np.float32)
+                all_pts = np.hstack((xyz, t))
+                has_time = False
+            else:
+                # 找 timestamp 欄位 index
+                idx_t = properties.index("timestamp")
+                xyz = pts[:, :3]
+                t   = pts[:, idx_t].reshape(-1,1)
+                all_pts = np.hstack((xyz, t))
+                has_time = True
 
-        print(f"✅ 載入 {vertex_cnt} 點，包含座標系。")
-        print("Loaded poses:", self.loaded_poses.keys())
+            self.loaded_points = all_pts.astype(np.float32)
+
+            # 初始化時間範圍
+            if has_time:
+                self.file_time_min   = float(all_pts[:,3].min())
+                self.file_time_max   = float(all_pts[:,3].max())
+            else:
+                self.file_time_min   = 0.0
+                self.file_time_max   = 0.0
+
+            self.file_time_start = self.file_time_min
+            self.file_time_end   = self.file_time_max
+
+        print(f"✅ 載入 {vertex_cnt} 點，"
+            f"{'含' if has_time else '不含'} timestamp，"
+            f"時間範圍：{self.file_time_min:.3f} – {self.file_time_max:.3f}")
+
+
 
 
 
