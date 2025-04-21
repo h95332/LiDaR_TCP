@@ -17,6 +17,50 @@ import tkinter as tk
 from tkinter import filedialog, messagebox
 
 # =============================================================================
+# ★★  Multi‑ArUco 量測表  ★★
+#   build_transform(tx,ty,tz, yaw,pitch,roll)  角度單位 deg, 先旋轉後平移
+# =============================================================================
+def build_transform(tx, ty, tz, yaw_deg=0.0, pitch_deg=0.0, roll_deg=0.0):
+    rx, ry, rz = np.radians([roll_deg, pitch_deg, yaw_deg])
+    cx, sx = np.cos(rx), np.sin(rx)
+    cy, sy = np.cos(ry), np.sin(ry)
+    cz, sz = np.cos(rz), np.sin(rz)
+    Rz = np.array([[cz, -sz, 0, 0],[sz, cz, 0, 0],[0, 0, 1, 0],[0, 0, 0, 1]], np.float32)
+    Ry = np.array([[cy, 0, sy, 0],[0, 1, 0, 0],[-sy, 0, cy, 0],[0, 0, 0, 1]], np.float32)
+    Rx = np.array([[1, 0, 0, 0],[0, cx, -sx, 0],[0, sx, cx, 0],[0, 0, 0, 1]], np.float32)
+    T  = np.eye(4, dtype=np.float32);  T[:3, 3] = [tx, ty, tz]
+    return T @ Rz @ Ry @ Rx
+
+GLOBAL_TO_MARKER = {
+    0: np.eye(4, dtype=np.float32),              # id 0 為世界原點
+    1: build_transform(0.420, 0.000, 0.000),     # 以下請依手動量測填值
+    2: build_transform(0.000, 0.315, 0.000),
+    # …持續新增
+}
+
+# =============================================================================
+# ★★  全域點雲緩衝 (按鈕觸發才 append)  ★★
+# =============================================================================
+GLOBAL_MAX_POINTS = 20_000_000
+global_pts  = np.zeros((GLOBAL_MAX_POINTS, 3), np.float32)
+global_size = 0
+global_lock = threading.Lock()
+
+def add_to_global(new_pts: np.ndarray):
+    """把 new_pts(N,3) 追加到 global_pts；滿就覆蓋最舊"""
+    global global_size
+    n = new_pts.shape[0]
+    if n == 0: return
+    with global_lock:
+        if global_size + n > GLOBAL_MAX_POINTS:
+            keep = GLOBAL_MAX_POINTS - n
+            if keep > 0:
+                global_pts[:keep] = global_pts[global_size - keep:global_size]
+            global_size = keep
+        global_pts[global_size:global_size + n] = new_pts
+        global_size += n
+
+# =============================================================================
 # 全域變數：ArUco 轉換矩陣（4x4）與鎖
 # =============================================================================
 global_transform_lock = threading.Lock()
@@ -60,25 +104,29 @@ def detect_aruco_thread(camera_id=0, dictionary=aruco.DICT_4X4_250):
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         corners, ids, _ = aruco.detectMarkers(gray, aruco_dict, parameters=parameters)
 
+        # ---------- 同時處理多顆 ArUco ----------
         if ids is not None:
             frame = aruco.drawDetectedMarkers(frame, corners, ids)
-            rvecs, tvecs, _ = aruco.estimatePoseSingleMarkers(corners, 0.19, camera_matrix, dist_coeffs)
-            # 取第一個標記作為示例
-            rvec = rvecs[0][0]
-            tvec = tvecs[0][0]
-            # 旋轉向量轉換為旋轉矩陣
-            rotation_matrix, _ = cv2.Rodrigues(rvec)
-            # 組合成 4x4 齊次變換矩陣
-            transform_matrix = np.eye(4, dtype=np.float32)
-            transform_matrix[:3, :3] = rotation_matrix.astype(np.float32)
-            transform_matrix[:3, 3] = tvec.astype(np.float32)
-            # 更新全域變數
-            with latest_transform_lock:
-                 latest_transform_matrix[:] = transform_matrix.copy()
+            rvecs, tvecs, _ = aruco.estimatePoseSingleMarkers(
+                corners, 0.19, camera_matrix, dist_coeffs)
 
-            # 顯示 3D 坐標軸於影像上（多個標記時依序顯示）
-            for rv, tv in zip(rvecs, tvecs):
-                cv2.drawFrameAxes(frame, camera_matrix, dist_coeffs, rv, tv, 0.1)
+            for i, id_arr in enumerate(ids):
+                mid = int(id_arr[0])
+                if mid not in GLOBAL_TO_MARKER:        # 未登錄則跳過
+                    continue
+                rotM, _ = cv2.Rodrigues(rvecs[i][0])
+                Cam_T_marker = np.eye(4, dtype=np.float32)
+                Cam_T_marker[:3, :3] = rotM
+                Cam_T_marker[:3, 3]  = tvecs[i][0]
+
+                Global_T_marker = GLOBAL_TO_MARKER[mid]   # 原點→marker
+                Cam_T_Global = Cam_T_marker @ Global_T_marker
+
+                with latest_transform_lock:
+                    latest_transform_matrix[:] = Cam_T_Global
+                cv2.drawFrameAxes(frame, camera_matrix, dist_coeffs,
+                                  rvecs[i][0], tvecs[i][0], 0.1)
+                break   # 找到一顆即可
 
         cv2.imshow('ArUco Detection', frame)
         if cv2.waitKey(1) & 0xFF == ord('q'):
@@ -287,7 +335,7 @@ void main(){
 # PointCloudViewer 類別：負責點雲視覺化與使用者互動
 # =============================================================================
 class PointCloudViewer:
-    def __init__(self, width=1600, height=800):
+    def __init__(self, width=1600, height=800, enable_network=True):
         self.width = width
         self.height = height
         self.rotation_x = 0.0  
@@ -300,8 +348,9 @@ class PointCloudViewer:
         self.points_lock = threading.Lock()
         
         # 啟動 UDP 接收線程
-        self.udp_receiver = UDPReceiver('0.0.0.0', 8080, self.ring_buffer, self.points_lock)
-        self.udp_receiver.start()
+        if enable_network:
+            self.udp_receiver = UDPReceiver('0.0.0.0', 8080, self.ring_buffer, self.points_lock)
+            self.udp_receiver.start()
 
         # 初始化 GLFW、ImGui、Shader 與 OpenGL 緩衝區
         self.init_glfw()
@@ -310,9 +359,10 @@ class PointCloudViewer:
         self.init_buffers()
 
         # 啟動 TCP 傳送（此處示例連線至指定的 IP 與埠）
-        self.tcp_sender_thread = threading.Thread(target=self.tcp_sender, args=("192.168.137.1", 9000), daemon=True)
-        #self.tcp_sender_thread = threading.Thread(target=self.tcp_sender, args=("127.0.0.1", 9000), daemon=True)
-        self.tcp_sender_thread.start()
+        if enable_network:
+            self.tcp_sender_thread = threading.Thread(target=self.tcp_sender, args=("192.168.137.1", 9000), daemon=True)
+            #self.tcp_sender_thread = threading.Thread(target=self.tcp_sender, args=("127.0.0.1", 9000), daemon=True)
+            self.tcp_sender_thread.start()
         # 定義預設的坐標系資訊，以 identity matrix 作為範例
         self.coordinate_system = {
             "matrix": list(pyrr.matrix44.create_identity(dtype=np.float32))
@@ -439,8 +489,14 @@ class PointCloudViewer:
         glEnable(GL_DEPTH_TEST)
 
     def init_imgui(self):
-        imgui.create_context()
+        # 每个 Viewer 都建立自己独立的 ImGui context
+        self.imgui_ctx = imgui.create_context()
+        imgui.style_colors_dark()           # 喜欢别的风格随意改
+        # 绑定到当前窗口
+        imgui.set_current_context(self.imgui_ctx)
         self.impl = GlfwRenderer(self.window)
+
+
 
     def init_shaders(self):
         self.shader_program = create_shader_program(vertex_shader_source, fragment_shader_source)
@@ -740,7 +796,9 @@ class PointCloudViewer:
             else:
                 # 無 timestamp 時顯示提示文字
                 imgui.text("(This file does not have a timestamp)")
-
+        if imgui.button("Add to Global Map"):
+            # ➜ pts_array 目前已轉到 Global, 直接累積
+            add_to_global(pts_array.copy())
 
         imgui.text(f"Current points: {pts_array.shape[0]}")
         imgui.text(f"Total stored: {total_pts}")
@@ -936,6 +994,73 @@ class PointCloudViewer:
             f"時間範圍：{self.file_time_min:.3f} – {self.file_time_max:.3f}")
 
 
+# =============================================================================
+# ★★  GlobalPointCloudViewer：僅顯示 global_pts  ★★
+# =============================================================================
+# =============================================================================
+# ★★  GlobalPointCloudViewer：只顯示 global_pts，但保有全部互動 ★★
+# =============================================================================
+class GlobalPointCloudViewer(PointCloudViewer):
+    def __init__(self, width=1600, height=800):
+        super().__init__(width, height, enable_network=False)
+        glfw.set_window_title(self.window, "Global Map Viewer")
+        # → 切到自己 instance 的 context，而不是不存在的 class 屬性
+        imgui.set_current_context(self.imgui_ctx)
+        self.impl = GlfwRenderer(self.window)
+        
+    def render(self):
+        glClearColor(0.1, 0.1, 0.1, 1.0)
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
+
+        # -------------------------
+        # 繪製背景格線（同 Live 版）
+        # -------------------------
+        glUseProgram(self.shader_program)
+        glUniform1i(glGetUniformLocation(self.shader_program, "useUniformColor"), 1)
+        glBindVertexArray(self.grid_vao)
+        glUniform4f(glGetUniformLocation(self.shader_program, "uColor"),
+                    0.7, 0.7, 0.7, 1.0)
+        glDrawArrays(GL_LINES, 0, self.grid_vertex_count)
+        glBindVertexArray(0)
+
+        # ===== 建 MVP（沿用父類計算方式） =====
+        base_eye = np.array([0.0, -self.zoom, 5.0], np.float32)
+        eye  = base_eye + self.pan_offset
+        target = self.pan_offset
+        view = pyrr.matrix44.create_look_at(eye, target,
+                                            np.array([0, 1, 0], np.float32))
+        pitch = pyrr.matrix44.create_from_x_rotation(self.rotation_x)
+        yaw   = pyrr.matrix44.create_from_z_rotation(self.rotation_y)
+        model = pyrr.matrix44.multiply(yaw, pitch)
+        MVP = pyrr.matrix44.multiply(model,
+              pyrr.matrix44.multiply(view, self.projection))
+
+        # ===== 取 global_pts 資料 =====
+        with global_lock:
+            pts_show = global_pts[:global_size].copy()
+
+        glUseProgram(self.shader_program)
+        glUniformMatrix4fv(self.mvp_loc, 1, GL_FALSE, MVP)
+        glUniform1i(glGetUniformLocation(self.shader_program, "useUniformColor"), 0)
+        glUniform1f(self.max_distance_loc,  self.max_distance)
+
+        if pts_show.size:
+            pts_show = np.ascontiguousarray(pts_show, np.float32)
+            glBindBuffer(GL_ARRAY_BUFFER, self.point_vbo)
+            glBufferSubData(GL_ARRAY_BUFFER, 0, pts_show.nbytes, pts_show)
+            glBindVertexArray(self.point_vao)
+            glDrawArrays(GL_POINTS, 0, min(pts_show.shape[0], self.max_points))
+            glBindVertexArray(0)
+
+        # ImGui（顯示點數即可）
+        imgui.new_frame()
+        imgui.begin("Global Map")
+        imgui.text(f"Accumulated points: {global_size}")
+        imgui.end()
+        imgui.render()
+        self.impl.render(imgui.get_draw_data())
+        glfw.swap_buffers(self.window)
+
 
 
 
@@ -944,10 +1069,36 @@ class PointCloudViewer:
 # 先啟動 ArUco 偵測線程，再建立並運行點雲視覺化應用
 # =============================================================================
 if __name__ == '__main__':
-    # 啟動 ArUco 偵測
     aruco_thread = threading.Thread(target=detect_aruco_thread, args=(0,), daemon=True)
     aruco_thread.start()
 
-    # 啟動點雲視覺化
-    viewer = PointCloudViewer()
-    viewer.run()
+    live_view   = PointCloudViewer()
+    global_view = GlobalPointCloudViewer()
+
+    while (not glfw.window_should_close(live_view.window) and
+           not glfw.window_should_close(global_view.window)):
+
+        glfw.poll_events()
+
+        # —— Live Window ——
+        glfw.make_context_current(live_view.window)
+        w, h = glfw.get_framebuffer_size(live_view.window)
+        glViewport(0, 0, w, h)
+        imgui.set_current_context(live_view.imgui_ctx)    # ← 變這裡
+        live_view.impl.process_inputs()
+        live_view.update()
+        live_view.render()
+
+        # —— Global Window ——
+        glfw.make_context_current(global_view.window)
+        w, h = glfw.get_framebuffer_size(global_view.window)
+        glViewport(0, 0, w, h)
+        imgui.set_current_context(global_view.imgui_ctx)  # ← 還有這裡
+        global_view.impl.process_inputs()
+        global_view.update()
+        global_view.render()
+
+
+    glfw.terminate()
+
+
