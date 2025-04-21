@@ -90,7 +90,7 @@ def detect_aruco_thread(camera_id=0, dictionary=aruco.DICT_4X4_250):
 # =============================================================================
 # 點雲轉換函數：利用 4x4 齊次變換矩陣轉換 (N, 3) 點雲資料
 # =============================================================================
-def transform_point_cloud(points, transform_matrix):
+def transform_point_cloud(points, Lidar_T_Aruco):
     """
     參數:
       points (np.ndarray): (N, 3) 點雲資料
@@ -102,7 +102,9 @@ def transform_point_cloud(points, transform_matrix):
         return points
     ones = np.ones((points.shape[0], 1), dtype=points.dtype)
     points_hom = np.hstack((points, ones))
-    transformed = (transform_matrix @ points_hom.T).T
+    arTlidar = np.linalg.inv(Lidar_T_Aruco) #  # ArUco 到 LiDAR 的變換矩陣
+    transformed = (arTlidar @ points_hom.T).T
+    
     return transformed[:, :3]
 
 # =============================================================================
@@ -362,10 +364,13 @@ class PointCloudViewer:
                 else:
                     # 先篩出 xyz（不含舊的 timestamp）
                     mask = np.logical_and(
-                        self.loaded_points[:,3] >= self.file_time_start,
+                        self.loaded_points[:,3] >= self.file_time_start, 
                         self.loaded_points[:,3] <= self.file_time_end
                     )
                     pts = self.loaded_points[mask, :3].astype(np.float32)
+                    #復原用
+                    pts3d_lidar_base = transform_point_cloud(pts, np.linalg.inv(self.Lidar_Position))
+                    pts = transform_point_cloud(pts3d_lidar_base, np.linalg.inv(self.Lidar_Position))
                     # 用現在系統時間取代所有 timestamp
                     stamps = np.full((pts.shape[0], 1),
                                     time.time(),
@@ -632,8 +637,11 @@ class PointCloudViewer:
             self.Word_Point      = self.loaded_poses.get("world",  np.eye(4, dtype=np.float32))
             self.Camera_Position = self.loaded_poses.get("camera", np.eye(4, dtype=np.float32))
             self.Lidar_Position  = self.loaded_poses.get("lidar",  np.eye(4, dtype=np.float32))
-            self.Lidar_T_Aruco   = None  # 不再需要 transform_point_cloud
 
+            self.Lidar_T_Aruco   = None  # 不再需要 transform_point_cloud
+            #復原用
+            pts3d_lidar_base = transform_point_cloud(pts3d, np.linalg.inv(self.Lidar_Position))
+            pts_array = transform_point_cloud(pts3d_lidar_base, np.linalg.inv(self.Lidar_Position))
         # -------------------------
         # 繪製點雲
         # -------------------------
