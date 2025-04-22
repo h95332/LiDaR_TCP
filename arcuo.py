@@ -33,8 +33,9 @@ def build_transform(tx, ty, tz, yaw_deg=0.0, pitch_deg=0.0, roll_deg=0.0):
 
 GLOBAL_TO_MARKER = {
     0: np.eye(4, dtype=np.float32),              # id 0 為世界原點
-    1: build_transform(0.420, 0.000, 0.000),     # 以下請依手動量測填值
-    2: build_transform(0.000, 0.315, 0.000),
+    1: build_transform(0.000, -5.000, 0.000),     # 以下請依手動量測填值
+    2: build_transform(0.000, 5.0, 0.000),
+    3: build_transform(5.000, 0.0, 0.000),
     # …持續新增
 }
 
@@ -45,6 +46,14 @@ GLOBAL_MAX_POINTS = 20_000_000
 global_pts  = np.zeros((GLOBAL_MAX_POINTS, 3), np.float32)
 global_size = 0
 global_lock = threading.Lock()
+# 全域座標系緩存：key → 4×4 矩陣
+global_coords = {}
+
+
+def add_global_coord(name: str, mat: np.ndarray):
+    """把 name:4×4 矩陣 加到全域座標系，重複 name 會直接覆蓋"""
+    global_coords[name] = mat.copy()
+
 
 def add_to_global(new_pts: np.ndarray):
     """把 new_pts(N,3) 追加到 global_pts；滿就覆蓋最舊"""
@@ -797,8 +806,17 @@ class PointCloudViewer:
                 # 無 timestamp 時顯示提示文字
                 imgui.text("(This file does not have a timestamp)")
         if imgui.button("Add to Global Map"):
-            # ➜ pts_array 目前已轉到 Global, 直接累積
+            # 1) 將點雲累積
             add_to_global(pts_array.copy())
+            # 2) 將最新的三個座標系也放到全域
+            add_global_coord("world",  self.Word_Point)
+            add_global_coord("camera", self.Camera_Position)
+            add_global_coord("lidar",  self.Lidar_Position)
+             # ★ 同步把每一顆 ArUco marker 靜態座標系也註冊到 global_coords
+            for mid, world_to_marker in GLOBAL_TO_MARKER.items():
+                if mid == 0:       # 跳過世界原點
+                    continue
+                add_global_coord(f"marker_{mid}", world_to_marker)
 
         imgui.text(f"Current points: {pts_array.shape[0]}")
         imgui.text(f"Total stored: {total_pts}")
@@ -1011,7 +1029,7 @@ class GlobalPointCloudViewer(PointCloudViewer):
     def render(self):
         glClearColor(0.1, 0.1, 0.1, 1.0)
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
-
+        global global_size
         # -------------------------
         # 繪製背景格線（同 Live 版）
         # -------------------------
@@ -1022,6 +1040,19 @@ class GlobalPointCloudViewer(PointCloudViewer):
                     0.7, 0.7, 0.7, 1.0)
         glDrawArrays(GL_LINES, 0, self.grid_vertex_count)
         glBindVertexArray(0)
+        glLineWidth(2.0)
+        for name, mat in global_coords.items():
+            # 依 name 分配顏色（可自行調整）
+            if name == "world":
+                cols = [(1,0,0),(0,1,0),(0,0,1)]
+            elif name == "camera":
+                cols = [(1,1,0),(1,0.5,0),(0.5,0,1)]
+            elif name == "lidar":
+                cols = [(0,1,1),(1,0,1),(0.5,0.5,1)]
+            else:
+                cols = [(1,1,1),(1,1,1),(1,1,1)]
+            self.draw_axes_from_matrix(mat, scale=1.0, colors=cols)
+        glLineWidth(1.0)
 
         # ===== 建 MVP（沿用父類計算方式） =====
         base_eye = np.array([0.0, -self.zoom, 5.0], np.float32)
@@ -1055,6 +1086,16 @@ class GlobalPointCloudViewer(PointCloudViewer):
         # ImGui（顯示點數即可）
         imgui.new_frame()
         imgui.begin("Global Map")
+        if imgui.button("Reset View"):
+            self.rotation_x = 0.0
+            self.rotation_y = 0.0
+            self.pan_offset = np.array([0.0, 0.0, 0.0], dtype=np.float32)
+            self.zoom       = 20.0
+        if imgui.button("Clear Global Points"):
+            with global_lock:
+                global_size = 0
+                global_pts[:] = 0
+                global_coords.clear()
         imgui.text(f"Accumulated points: {global_size}")
         imgui.end()
         imgui.render()
