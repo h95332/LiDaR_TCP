@@ -33,8 +33,8 @@ def build_transform(tx, ty, tz, yaw_deg=0.0, pitch_deg=0.0, roll_deg=0.0):
 
 GLOBAL_TO_MARKER = {
     0: np.eye(4, dtype=np.float32),              # id 0 為世界原點
-    1: build_transform(0.000, -5.000, 0.000),     # 以下請依手動量測填值
-    2: build_transform(0.000, 5.0, 0.000),
+    1: build_transform(0.000, 1.600, 0.000),     # 以下請依手動量測填值
+    2: build_transform(0.000, -5.0, 0.000),
     3: build_transform(5.000, 0.0, 0.000),
     # …持續新增
 }
@@ -355,7 +355,10 @@ class PointCloudViewer:
         self.pan_offset = np.array([0.0, 0.0, 0.0], dtype=np.float32)
         self.ring_buffer = PointRingBuffer(max_points=10000000)
         self.points_lock = threading.Lock()
-        
+        # 0 = Live, 1 = Global, 2 = File
+        self.send_mode = 0
+        self.save_source = 0
+
         # 啟動 UDP 接收線程
         if enable_network:
             self.udp_receiver = UDPReceiver('0.0.0.0', 8080, self.ring_buffer, self.points_lock)
@@ -414,27 +417,31 @@ class PointCloudViewer:
             # 連線成功後持續送資料
             while True:
                 # ► 準備要送的點雲資料（live / 檔案模式分支）
-                if self.use_live_data:
+                if self.send_mode == 0:
+                    # ► Live 模式
                     with self.points_lock:
                         pts = self.ring_buffer.get_recent_points(self.retention_seconds)
-                    data3 = transform_point_cloud(pts, self.Lidar_T_Aruco)
-                    stamps = np.full((data3.shape[0], 1), time.time(), dtype=np.float32)
-                    data4 = np.hstack((data3, stamps))
-                else:
-                    # 先篩出 xyz（不含舊的 timestamp）
+                    pts3 = transform_point_cloud(pts, self.Lidar_T_Aruco)
+                    stamps = np.full((pts3.shape[0],1), time.time(), dtype=np.float32)
+                    data4 = np.hstack((pts3, stamps))
+
+                elif self.send_mode == 1:
+                    # ► Global 模式
+                    with global_lock:
+                        glob = global_pts[:global_size].copy()
+                    # global_pts 已经是在世界坐标系下的 xyz
+                    stamps = np.full((glob.shape[0],1), time.time(), dtype=np.float32)
+                    data4 = np.hstack((glob, stamps))
+
+                else:  # self.send_mode == 2
+                    # ► File 模式（已有载入逻辑，直接把 loaded_points 用起来）
                     mask = np.logical_and(
-                        self.loaded_points[:,3] >= self.file_time_start, 
+                        self.loaded_points[:,3] >= self.file_time_start,
                         self.loaded_points[:,3] <= self.file_time_end
                     )
                     pts = self.loaded_points[mask, :3].astype(np.float32)
-                    #復原用
-                    pts3d_lidar_base = transform_point_cloud(pts, np.linalg.inv(self.Lidar_Position))
-                    pts = transform_point_cloud(pts3d_lidar_base, np.linalg.inv(self.Lidar_Position))
-                    # 用現在系統時間取代所有 timestamp
-                    stamps = np.full((pts.shape[0], 1),
-                                    time.time(),
-                                    dtype=np.float32)
-                    data4 = np.hstack((pts, stamps)) 
+                    stamps = np.full((pts.shape[0],1), time.time(), dtype=np.float32)
+                    data4 = np.hstack((pts, stamps))
 
                 # 拆出 XYZ bytes
                  # 傳送 x,y,z,timestamp
@@ -704,9 +711,9 @@ class PointCloudViewer:
             self.Lidar_Position  = self.loaded_poses.get("lidar",  np.eye(4, dtype=np.float32))
 
             self.Lidar_T_Aruco   = None  # 不再需要 transform_point_cloud
-            #復原用
-            pts3d_lidar_base = transform_point_cloud(pts3d, np.linalg.inv(self.Lidar_Position))
-            pts_array = transform_point_cloud(pts3d_lidar_base, np.linalg.inv(self.Lidar_Position))
+            # #復原用
+            # pts3d_lidar_base = transform_point_cloud(pts3d, np.linalg.inv(self.Lidar_Position))
+            # pts_array = transform_point_cloud(pts3d_lidar_base, np.linalg.inv(self.Lidar_Position))
         # -------------------------
         # 繪製點雲
         # -------------------------
@@ -759,67 +766,98 @@ class PointCloudViewer:
         # -------------------------
         imgui.new_frame()
         imgui.begin("Control Panel")
-        _, self.retention_seconds = imgui.slider_float("Storage seconds", self.retention_seconds, 1.0, 30.0)
-        _, self.max_distance      = imgui.slider_float("Max distance",     self.max_distance,     1.0, 20.0)
-        changed, self.use_live_data = imgui.checkbox("Live Mode", self.use_live_data)
+
+        # —— 第一部分：视图 & 参数 —— #
+        imgui.begin_group()
+        imgui.text(" Settings")
+        imgui.separator()
+        imgui.push_item_width(150)
+        _, self.retention_seconds = imgui.slider_float(
+            "Storage seconds", self.retention_seconds, 1.0, 30.0)
+        _, self.max_distance = imgui.slider_float(
+            "Max distance", self.max_distance, 1.0, 20.0)
+        changed, self.use_live_data = imgui.checkbox(
+            "Live Mode", self.use_live_data)
+        imgui.end_group()
+
+        imgui.same_line()
+
+        # —— 第二部分：文件操作 & 网络 —— #
+        imgui.begin_group()
+        imgui.text("I/O & Network")
+        imgui.separator()
         if imgui.button("Open Saved PLY"):
             tk.Tk().withdraw()
-            path = filedialog.askopenfilename(filetypes=[("PLY files","*.ply")])
+            path = filedialog.askopenfilename(
+                filetypes=[("PLY files", "*.ply")])
             if path:
                 self.load_ply_with_pose(path)
                 self.use_live_data = False
+        # 在 render() 裡 ImGui 控制面板的 I/O & Network 區塊
+        imgui.separator()
+        imgui.text(" Save source:")
+        if imgui.radio_button("Live",   self.save_source == 0):
+            self.save_source = 0
+        imgui.same_line()
+        if imgui.radio_button("Global", self.save_source == 1):
+            self.save_source = 1
+
+        imgui.separator()
+        if imgui.button("Save to .PLY"):
+            if self.save_source == 0:
+                self.save_live_to_ply()
+            else:
+                self.save_global_to_ply()
         if imgui.button("Clear Point Cloud"):
             with self.points_lock:
-                self.ring_buffer.clear()
-        if imgui.button("Save to .PLY"):
-            self.save_points_to_ply()
-        if imgui.button("Restart TCP Connection"):
+                self.ring_buffer.clear()  
+        imgui.separator()
+        if imgui.button("Restart TCP Conn"):
             self.restart_tcp_connection("192.168.137.1", 9000)
-        if imgui.button("Reset View"):
-            self.rotation_x = 0.0
-            self.rotation_y = 0.0
-            self.pan_offset = np.array([0.0, 0.0, 0.0], dtype=np.float32)
-            self.zoom = 20.0
-        if imgui.button("Exit Application"):
+        if imgui.button("Update ArUco"):
+            with latest_transform_lock, global_transform_lock:
+                global_transform[:] = latest_transform_matrix.copy()
+        if imgui.button("Exit App"):
             glfw.set_window_should_close(self.window, True)
-        if imgui.button("Update ArUco Transform"):
-            with latest_transform_lock:
-                with global_transform_lock:
-                    global_transform[:] = latest_transform_matrix.copy()
-            print("✅ 已套用最新 ArUco 位置至 global_transform")
-        if not self.use_live_data:
-            # 只有載入的檔案真的有 time 才顯示滑桿
-            if self.file_time_max > self.file_time_min:
-                _, self.file_time_start = imgui.slider_float(
-                    "Start Time",
-                    self.file_time_start,
-                    self.file_time_min,
-                    self.file_time_end
-                )
-                _, self.file_time_end   = imgui.slider_float(
-                    "  End Time",
-                    self.file_time_end,
-                    self.file_time_start,
-                    self.file_time_max
-                )
-            else:
-                # 無 timestamp 時顯示提示文字
-                imgui.text("(This file does not have a timestamp)")
+        imgui.end_group()
+
+        imgui.separator()
+
+        # —— 第三部分：Global Map 操作 —— #
+        imgui.begin_group()
+        imgui.text(" Global Map")
+        imgui.separator()
         if imgui.button("Add to Global Map"):
-            # 1) 將點雲累積
             add_to_global(pts_array.copy())
-            # 2) 將最新的三個座標系也放到全域
             add_global_coord("world",  self.Word_Point)
             add_global_coord("camera", self.Camera_Position)
             add_global_coord("lidar",  self.Lidar_Position)
-             # ★ 同步把每一顆 ArUco marker 靜態座標系也註冊到 global_coords
-            for mid, world_to_marker in GLOBAL_TO_MARKER.items():
-                if mid == 0:       # 跳過世界原點
-                    continue
-                add_global_coord(f"marker_{mid}", world_to_marker)
+            for mid, w2m in GLOBAL_TO_MARKER.items():
+                if mid == 0: continue
+                add_global_coord(f"marker_{mid}", w2m)
+        imgui.end_group()
 
-        imgui.text(f"Current points: {pts_array.shape[0]}")
+        imgui.separator()
+
+        # —— 第四部分：Send Mode & 状态显示 —— #
+        imgui.begin_group()
+        imgui.text("Send Mode:")
+        imgui.separator()
+        # radio_button 回傳 True/False，不要用 unpack
+        if imgui.radio_button("Live##send",   self.send_mode == 0):
+            self.send_mode = 0
+        imgui.same_line()
+        if imgui.radio_button("Global##send", self.send_mode == 1):
+            self.send_mode = 1
+        imgui.same_line()
+        if imgui.radio_button("File##send",   self.send_mode == 2):
+            self.send_mode = 2
+
+        imgui.separator()
+        imgui.text(f"Current pts: {pts_array.shape[0]}")
         imgui.text(f"Total stored: {total_pts}")
+        imgui.end_group()
+
         imgui.end()
         imgui.render()
         self.impl.render(imgui.get_draw_data())
@@ -847,10 +885,10 @@ class PointCloudViewer:
         except Exception as e:
             print(f"儲存點雲資料時發生錯誤: {e}")
 
-    def save_points_to_ply(self):
+    def save_live_to_ply(self):
         with self.points_lock:
-            raw = self.ring_buffer.buffer[:self.ring_buffer.size].copy()
-        if raw.size == 0:
+            pts = self.ring_buffer.get_recent_points(self.retention_seconds)  # Nx3
+        if pts.shape[0] == 0:
             print("沒有可儲存的點雲資料")
             return
 
@@ -860,8 +898,8 @@ class PointCloudViewer:
         Lidar_T_Aruco = np.linalg.inv(Cam_T_Lidar) @ Camera_T_Aruco
 
         # 先轉 XYZ，再把 timestamp 併回
-        pts_xyz = transform_point_cloud(raw[:, :3], Lidar_T_Aruco)
-        ts      = raw[:, 3].reshape(-1,1).astype(np.float32)
+        pts_xyz = transform_point_cloud(pts, Lidar_T_Aruco)
+        ts = np.full((pts_xyz.shape[0], 1), time.time(), dtype=np.float32)
         data4   = np.hstack((pts_xyz, ts))  # shape=(N,4)
 
         # PLY header，新增 timestamp 屬性
@@ -895,6 +933,55 @@ class PointCloudViewer:
                 header),
             daemon=True
         ).start()
+
+    def save_global_to_ply(self):
+        # 1) 取出 global_pts
+        with global_lock:
+            pts = global_pts[:global_size].copy()
+        if pts.size == 0:
+            print("Global Map 是空的，無點可存")
+            return
+
+        # 2) 統一 timestamp (這裡我用當下時間)
+        stamps = np.full((pts.shape[0],1), time.time(), dtype=np.float32)
+        data4 = np.hstack((pts, stamps))  # shape=(N,4)
+
+        # 3) PLY header（加入所有坐標系 comment）
+        header_lines = [
+            "ply",
+            "format binary_little_endian 1.0",
+            f"element vertex {len(data4)}",
+            "property float x",
+            "property float y",
+            "property float z",
+            "property float timestamp",
+        ]
+
+        # helper：把一個 4x4 矩陣展開成多行 comment
+        def matrix_to_comments(name, mat):
+            flat = mat.flatten()
+            return [f"comment {name}_{i} {v:.6f}" for i, v in enumerate(flat)]
+
+        # 把 global_coords 裡的每個坐標系都寫入
+        for name, mat in global_coords.items():
+            header_lines += matrix_to_comments(name, mat)
+
+        header_lines.append("end_header")
+        header = "\n".join(header_lines) + "\n"
+
+        # 4) 檔名
+        filename = os.path.join(
+            "saved_ply",
+            f"global_{time.strftime('%Y%m%d_%H%M%S')}.ply"
+        )
+
+        # 5) 背景執行緒寫入
+        threading.Thread(
+            target=self.save_points_to_ply_binary_task,
+            args=(data4, filename, header),
+            daemon=True
+        ).start()
+        print(f"開始將 Global Map (含所有坐標系) 寫入 {filename}…")
 
 
  # -------------------------
@@ -961,18 +1048,24 @@ class PointCloudViewer:
 
             # 讀頂點數
             vertex_cnt = next(int(l.split()[-1])
-                            for l in header if l.startswith("element vertex"))
+                              for l in header if l.startswith("element vertex"))
 
-            # 解析 poses（不變）
-            poses = {"camera":[0]*16, "lidar":[0]*16, "world":[0]*16}
+            # 動態解析所有 comment，包含各種 <name>_<idx>
+            poses_dict = {}
             for l in header:
-                if l.startswith("comment"):
-                    _, tag, val = l.split()
-                    name, idx = tag.split("_")
-                    poses[name][int(idx)] = float(val)
+                if not l.startswith("comment"):
+                    continue
+                _, tag, val = l.split()
+                # tag 格式：<name>_<idx>
+                name, idx_str = tag.rsplit("_", 1)
+                idx = int(idx_str)
+                poses_dict.setdefault(name, [0.0] * 16)
+                poses_dict[name][idx] = float(val)
+
+            # 建立 loaded_poses：name → 4×4 矩陣
             self.loaded_poses = {
-                k: np.array(v, dtype=np.float32).reshape(4,4)
-                for k,v in poses.items()
+                name: np.array(vals, dtype=np.float32).reshape(4, 4)
+                for name, vals in poses_dict.items()
             }
 
             # 根據 property 數量動態讀取 data
@@ -987,7 +1080,6 @@ class PointCloudViewer:
                 all_pts = np.hstack((xyz, t))
                 has_time = False
             else:
-                # 找 timestamp 欄位 index
                 idx_t = properties.index("timestamp")
                 xyz = pts[:, :3]
                 t   = pts[:, idx_t].reshape(-1,1)
@@ -1008,8 +1100,10 @@ class PointCloudViewer:
             self.file_time_end   = self.file_time_max
 
         print(f"✅ 載入 {vertex_cnt} 點，"
-            f"{'含' if has_time else '不含'} timestamp，"
-            f"時間範圍：{self.file_time_min:.3f} – {self.file_time_max:.3f}")
+              f"{'含' if has_time else '不含'} timestamp，"
+              f"時間範圍：{self.file_time_min:.3f} – {self.file_time_max:.3f}，"
+              f"解析到坐標系：{list(self.loaded_poses.keys())}")
+
 
 
 # =============================================================================
@@ -1086,6 +1180,29 @@ class GlobalPointCloudViewer(PointCloudViewer):
         # ImGui（顯示點數即可）
         imgui.new_frame()
         imgui.begin("Global Map")
+        if imgui.button("Open Saved PLY##global"):
+            tk.Tk().withdraw()
+            path = filedialog.askopenfilename(
+                filetypes=[("PLY files", "*.ply")],
+                title="選擇要加入全域地圖的 PLY 檔案"
+            )
+            if path:
+                # 1) 讀檔並解析 points + 3 種 pose
+                self.load_ply_with_pose(path)
+
+                # 2) 清空全域點雲與所有舊的坐標系
+                with global_lock:
+                    
+                    global_size = 0
+                global_coords.clear()
+
+                # 3) 把剛載入的 xyz 點雲加到 global_pts
+                pts = self.loaded_points[:, :3].copy()
+                add_to_global(pts)
+
+                # 4) 把 world / camera / lidar 三個坐標系也加入
+                for name, mat in self.loaded_poses.items():
+                    add_global_coord(name, mat)
         if imgui.button("Reset View"):
             self.rotation_x = 0.0
             self.rotation_y = 0.0
