@@ -33,9 +33,9 @@ def build_transform(tx, ty, tz, yaw_deg=0.0, pitch_deg=0.0, roll_deg=0.0):
 
 GLOBAL_TO_MARKER = {
     0: np.eye(4, dtype=np.float32),              # id 0 為世界原點
-    1: build_transform(0.000, 1.600, 0.000),     # 以下請依手動量測填值
-    2: build_transform(0.000, -5.0, 0.000),
-    3: build_transform(5.000, 0.0, 0.000),
+    1: build_transform(0.000, -5.00, 0.000),     # 以下請依手動量測填值
+    #2: build_transform(0.000, -5.0, 0.000),
+    #3: build_transform(5.000, 0.0, 0.000),
     # …持續新增
 }
 
@@ -129,7 +129,7 @@ def detect_aruco_thread(camera_id=0, dictionary=aruco.DICT_4X4_250):
                 Cam_T_marker[:3, 3]  = tvecs[i][0]
 
                 Global_T_marker = GLOBAL_TO_MARKER[mid]   # 原點→marker
-                Cam_T_Global = Cam_T_marker @ Global_T_marker
+                Cam_T_Global = Cam_T_marker @ np.linalg.inv(Global_T_marker)
 
                 with latest_transform_lock:
                     latest_transform_matrix[:] = Cam_T_Global
@@ -373,6 +373,7 @@ class PointCloudViewer:
         # 啟動 TCP 傳送（此處示例連線至指定的 IP 與埠）
         # 初始化可調整的 TCP/IP 參數
         self.tcp_host = "192.168.137.1"
+        #self.tcp_host = "127.0.0.1"
         self.tcp_port = 9000
         # 啟動 TCP 傳送（使用變數 self.tcp_host, self.tcp_port）
         if enable_network:
@@ -389,7 +390,7 @@ class PointCloudViewer:
         self.Word_Point = None
         self.Camera_Position = None 
         self.Lidar_Position =  None
-        self.Lidar_T_Aruco = None
+        self.Lidar_T_Aruco = np.eye(4, dtype=np.float32)
 
         self.use_live_data = True          # True ➜ 即時模式；False ➜ 載入檔案模式
         self.loaded_points = np.empty((0, 3), dtype=np.float32)
@@ -403,11 +404,16 @@ class PointCloudViewer:
         self.file_time_start = 0.0
         self.file_time_end   = 0.0
 
+        self.show_global = False            # 是否顯示 global 點雲
+        self.global_color = (1.0, 1.0, 1.0, 1.0)  # 畫 global 點的單一顏色
+
     
 
     def tcp_sender(self, host, port):
         import socket, time, struct, json
         import numpy as np
+        global global_coords
+
 
         while True:
             # 嘗試連線
@@ -422,6 +428,11 @@ class PointCloudViewer:
 
             # 連線成功後持續送資料
             while True:
+                        # 建一個純 Python dict，把所有 marker 的矩陣轉成 list
+                aruco_dict = {
+                    name: mat.tolist()
+                    for name, mat in global_coords.items()
+                    if name.startswith("marker_")}
                 # ► 準備要送的點雲資料（live / 檔案模式分支）
                 if self.send_mode == 0:
                     # ► Live 模式
@@ -430,6 +441,14 @@ class PointCloudViewer:
                     pts3 = transform_point_cloud(pts, self.Lidar_T_Aruco)
                     stamps = np.full((pts3.shape[0],1), time.time(), dtype=np.float32)
                     data4 = np.hstack((pts3, stamps))
+                                    # 組裝座標系 JSON
+                    coord_system = {
+                        "lidar":  self.Lidar_Position,
+                        "camera": self.Camera_Position,
+                        "world":  self.Word_Point,
+                        #"aruco":  aruco_dict             # marker_{id}: 4×4 list of lists
+
+                    }
 
                 elif self.send_mode == 1:
                     # ► Global 模式
@@ -438,6 +457,13 @@ class PointCloudViewer:
                     # global_pts 已经是在世界坐标系下的 xyz
                     stamps = np.full((glob.shape[0],1), time.time(), dtype=np.float32)
                     data4 = np.hstack((glob, stamps))
+                    # global_coords 裡頭 key = "world","camera","lidar","marker_1",…
+
+                    coord_system = {
+                        name: mat
+                        for name, mat in global_coords.items()
+                    }
+
 
                 else:  # self.send_mode == 2
                     # ► File 模式（已有载入逻辑，直接把 loaded_points 用起来）
@@ -448,17 +474,13 @@ class PointCloudViewer:
                     pts = self.loaded_points[mask, :3].astype(np.float32)
                     stamps = np.full((pts.shape[0],1), time.time(), dtype=np.float32)
                     data4 = np.hstack((pts, stamps))
+                    coord_system = self.loaded_poses.copy()
 
                 # 拆出 XYZ bytes
                  # 傳送 x,y,z,timestamp
                 points_bin = data4.astype(np.float32).tobytes()
 
-                # 組裝座標系 JSON
-                coord_system = {
-                    "lidar":  self.Lidar_Position,
-                    "camera": self.Camera_Position,
-                    "world":  self.Word_Point
-                }
+
                 coord_bin = json.dumps(coord_system, cls=NumpyEncoder).encode('utf-8')
 
                 # Header：coord 長度 + points 長度
@@ -657,6 +679,7 @@ class PointCloudViewer:
         self.handle_scroll_input()
 
     def render(self):
+        global global_size
         # 清除畫面
         glClearColor(0.2, 0.2, 0.2, 1.0)
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
@@ -687,7 +710,12 @@ class PointCloudViewer:
         # 取得點雲資料，支援 Live / PLY 切換
         # -------------------------
         glUniform1i(glGetUniformLocation(self.shader_program, "useUniformColor"), 0)
-        if self.use_live_data:
+        if self.show_global:
+        # ►► 只顯示 Global Map ◄◄
+            with global_lock:
+                pts_array = global_pts[:global_size].copy().astype(np.float32)
+            total_pts = global_size
+        elif self.use_live_data:
             # ► 即時模式：讀取環狀緩衝並套用最新 ArUco 變換
             with self.points_lock:
                 pts_array = self.ring_buffer.get_recent_points(self.retention_seconds)
@@ -768,6 +796,18 @@ class PointCloudViewer:
         glLineWidth(1.0)
 
         # -------------------------
+        # 繪製 Global Map 中的 ArUco 標記座標系
+        # -------------------------
+        if self.show_global:
+            glUniform1i(glGetUniformLocation(self.shader_program, "useUniformColor"), 1)
+            glLineWidth(2.0)
+            for name, mat in global_coords.items():
+                # 只畫 marker_* 開頭的
+                if name.startswith("marker_"):
+                    # mat 已經是世界座標下的 marker 變換
+                    self.draw_axes_from_matrix(mat, scale=0.5)
+            glLineWidth(1.0)
+        # -------------------------
         # ImGui 控制面板
         # -------------------------
         imgui.new_frame()
@@ -829,21 +869,6 @@ class PointCloudViewer:
         if imgui.button("Exit App"):
             glfw.set_window_should_close(self.window, True)
         imgui.end_group()
-        imgui.separator()
-
-        # —— 第三部分：Global Map 操作 —— #
-        imgui.begin_group()
-        imgui.text(" Global Map")
-        imgui.separator()
-        if imgui.button("Add to Global Map"):
-            add_to_global(pts_array.copy())
-            add_global_coord("world",  self.Word_Point)
-            add_global_coord("camera", self.Camera_Position)
-            add_global_coord("lidar",  self.Lidar_Position)
-            for mid, w2m in GLOBAL_TO_MARKER.items():
-                if mid == 0: continue
-                add_global_coord(f"marker_{mid}", w2m)
-        imgui.end_group()
 
         imgui.separator()
 
@@ -864,6 +889,54 @@ class PointCloudViewer:
         imgui.separator()
         imgui.text(f"Current pts: {pts_array.shape[0]}")
         imgui.text(f"Total stored: {total_pts}")
+        imgui.end_group()
+
+        imgui.begin_group()
+        imgui.text(" Global Map")
+        imgui.separator()
+        
+        # ── 新增功能 ──
+        changed, new_val = imgui.checkbox("Show Global##toggle",self.show_global)
+        if changed:
+            self.show_global = new_val    # 反轉即可
+        
+        if imgui.button("Open Saved PLY##global"):
+            tk.Tk().withdraw()
+            path = filedialog.askopenfilename(
+                filetypes=[("PLY files", "*.ply")],
+                title="選擇要加入全域地圖的 PLY 檔案"
+            )
+            if path:
+                # 讀檔→清空舊 global→匯入新點雲與三個 pose
+                self.load_ply_with_pose(path)
+                with global_lock:
+                    global_size = 0
+                global_coords.clear()
+                add_to_global(self.loaded_points[:, :3].copy())
+                for n, m in self.loaded_poses.items():
+                    add_global_coord(n, m)
+
+        if imgui.button("Add to Global Map"):
+            add_to_global(pts_array.copy())
+            add_global_coord("world",  self.Word_Point)
+            add_global_coord("camera", self.Camera_Position)
+            add_global_coord("lidar",  self.Lidar_Position)
+            for mid, w2m in GLOBAL_TO_MARKER.items():
+                if mid == 0: continue
+                add_global_coord(f"marker_{mid}", w2m)
+        
+        if imgui.button("Clear Global Points"):
+            with global_lock:
+                global_size = 0
+                global_pts[:] = 0
+                global_coords.clear()
+        
+        if imgui.button("Reset View"):
+            self.rotation_x = self.rotation_y = 0.0
+            self.pan_offset = np.array([0.0,0.0,0.0], np.float32)
+            self.zoom = 20.0
+        
+        imgui.text(f"Accumulated points: {global_size}")
         imgui.end_group()
 
         imgui.end()
@@ -1115,122 +1188,6 @@ class PointCloudViewer:
 
 
 # =============================================================================
-# ★★  GlobalPointCloudViewer：僅顯示 global_pts  ★★
-# =============================================================================
-# =============================================================================
-# ★★  GlobalPointCloudViewer：只顯示 global_pts，但保有全部互動 ★★
-# =============================================================================
-class GlobalPointCloudViewer(PointCloudViewer):
-    def __init__(self, width=1600, height=800):
-        super().__init__(width, height, enable_network=False)
-        glfw.set_window_title(self.window, "Global Map Viewer")
-        # → 切到自己 instance 的 context，而不是不存在的 class 屬性
-        imgui.set_current_context(self.imgui_ctx)
-        self.impl = GlfwRenderer(self.window)
-        
-    def render(self):
-        glClearColor(0.1, 0.1, 0.1, 1.0)
-        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
-        global global_size
-        # -------------------------
-        # 繪製背景格線（同 Live 版）
-        # -------------------------
-        glUseProgram(self.shader_program)
-        glUniform1i(glGetUniformLocation(self.shader_program, "useUniformColor"), 1)
-        glBindVertexArray(self.grid_vao)
-        glUniform4f(glGetUniformLocation(self.shader_program, "uColor"),
-                    0.7, 0.7, 0.7, 1.0)
-        glDrawArrays(GL_LINES, 0, self.grid_vertex_count)
-        glBindVertexArray(0)
-        glLineWidth(2.0)
-        for name, mat in global_coords.items():
-            # 依 name 分配顏色（可自行調整）
-            if name == "world":
-                cols = [(1,0,0),(0,1,0),(0,0,1)]
-            elif name == "camera":
-                cols = [(1,1,0),(1,0.5,0),(0.5,0,1)]
-            elif name == "lidar":
-                cols = [(0,1,1),(1,0,1),(0.5,0.5,1)]
-            else:
-                cols = [(1,1,1),(1,1,1),(1,1,1)]
-            self.draw_axes_from_matrix(mat, scale=1.0, colors=cols)
-        glLineWidth(1.0)
-
-        # ===== 建 MVP（沿用父類計算方式） =====
-        base_eye = np.array([0.0, -self.zoom, 5.0], np.float32)
-        eye  = base_eye + self.pan_offset
-        target = self.pan_offset
-        view = pyrr.matrix44.create_look_at(eye, target,
-                                            np.array([0, 1, 0], np.float32))
-        pitch = pyrr.matrix44.create_from_x_rotation(self.rotation_x)
-        yaw   = pyrr.matrix44.create_from_z_rotation(self.rotation_y)
-        model = pyrr.matrix44.multiply(yaw, pitch)
-        MVP = pyrr.matrix44.multiply(model,
-              pyrr.matrix44.multiply(view, self.projection))
-
-        # ===== 取 global_pts 資料 =====
-        with global_lock:
-            pts_show = global_pts[:global_size].copy()
-
-        glUseProgram(self.shader_program)
-        glUniformMatrix4fv(self.mvp_loc, 1, GL_FALSE, MVP)
-        glUniform1i(glGetUniformLocation(self.shader_program, "useUniformColor"), 0)
-        glUniform1f(self.max_distance_loc,  self.max_distance)
-
-        if pts_show.size:
-            pts_show = np.ascontiguousarray(pts_show, np.float32)
-            glBindBuffer(GL_ARRAY_BUFFER, self.point_vbo)
-            glBufferSubData(GL_ARRAY_BUFFER, 0, pts_show.nbytes, pts_show)
-            glBindVertexArray(self.point_vao)
-            glDrawArrays(GL_POINTS, 0, min(pts_show.shape[0], self.max_points))
-            glBindVertexArray(0)
-
-        # ImGui（顯示點數即可）
-        imgui.new_frame()
-        imgui.begin("Global Map")
-        if imgui.button("Open Saved PLY##global"):
-            tk.Tk().withdraw()
-            path = filedialog.askopenfilename(
-                filetypes=[("PLY files", "*.ply")],
-                title="選擇要加入全域地圖的 PLY 檔案"
-            )
-            if path:
-                # 1) 讀檔並解析 points + 3 種 pose
-                self.load_ply_with_pose(path)
-
-                # 2) 清空全域點雲與所有舊的坐標系
-                with global_lock:
-                    
-                    global_size = 0
-                global_coords.clear()
-
-                # 3) 把剛載入的 xyz 點雲加到 global_pts
-                pts = self.loaded_points[:, :3].copy()
-                add_to_global(pts)
-
-                # 4) 把 world / camera / lidar 三個坐標系也加入
-                for name, mat in self.loaded_poses.items():
-                    add_global_coord(name, mat)
-        if imgui.button("Reset View"):
-            self.rotation_x = 0.0
-            self.rotation_y = 0.0
-            self.pan_offset = np.array([0.0, 0.0, 0.0], dtype=np.float32)
-            self.zoom       = 20.0
-        if imgui.button("Clear Global Points"):
-            with global_lock:
-                global_size = 0
-                global_pts[:] = 0
-                global_coords.clear()
-        imgui.text(f"Accumulated points: {global_size}")
-        imgui.end()
-        imgui.render()
-        self.impl.render(imgui.get_draw_data())
-        glfw.swap_buffers(self.window)
-
-
-
-
-# =============================================================================
 # 程式進入點：
 # 先啟動 ArUco 偵測線程，再建立並運行點雲視覺化應用
 # =============================================================================
@@ -1239,32 +1196,13 @@ if __name__ == '__main__':
     aruco_thread.start()
 
     live_view   = PointCloudViewer()
-    global_view = GlobalPointCloudViewer()
 
-    while (not glfw.window_should_close(live_view.window) and
-           not glfw.window_should_close(global_view.window)):
-
+    while not glfw.window_should_close(live_view.window):
         glfw.poll_events()
-
-        # —— Live Window ——
         glfw.make_context_current(live_view.window)
-        w, h = glfw.get_framebuffer_size(live_view.window)
-        glViewport(0, 0, w, h)
-        imgui.set_current_context(live_view.imgui_ctx)    # ← 變這裡
         live_view.impl.process_inputs()
         live_view.update()
         live_view.render()
 
-        # —— Global Window ——
-        glfw.make_context_current(global_view.window)
-        w, h = glfw.get_framebuffer_size(global_view.window)
-        glViewport(0, 0, w, h)
-        imgui.set_current_context(global_view.imgui_ctx)  # ← 還有這裡
-        global_view.impl.process_inputs()
-        global_view.update()
-        global_view.render()
-
-
     glfw.terminate()
-
 
