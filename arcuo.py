@@ -371,9 +371,15 @@ class PointCloudViewer:
         self.init_buffers()
 
         # 啟動 TCP 傳送（此處示例連線至指定的 IP 與埠）
+        # 初始化可調整的 TCP/IP 參數
+        self.tcp_host = "192.168.137.1"
+        self.tcp_port = 9000
+        # 啟動 TCP 傳送（使用變數 self.tcp_host, self.tcp_port）
         if enable_network:
-            self.tcp_sender_thread = threading.Thread(target=self.tcp_sender, args=("192.168.137.1", 9000), daemon=True)
-            #self.tcp_sender_thread = threading.Thread(target=self.tcp_sender, args=("127.0.0.1", 9000), daemon=True)
+            self.tcp_sender_thread = threading.Thread(
+                target=self.tcp_sender,
+                args=(self.tcp_host, self.tcp_port),
+                daemon=True)
             self.tcp_sender_thread.start()
         # 定義預設的坐標系資訊，以 identity matrix 作為範例
         self.coordinate_system = {
@@ -786,6 +792,9 @@ class PointCloudViewer:
         imgui.begin_group()
         imgui.text("I/O & Network")
         imgui.separator()
+        # —— 自訂 TCP/IP 設定 —— #
+        _, self.tcp_host = imgui.input_text("TCP IP", self.tcp_host, 64)
+        _, self.tcp_port = imgui.input_int("TCP Port", self.tcp_port)
         if imgui.button("Open Saved PLY"):
             tk.Tk().withdraw()
             path = filedialog.askopenfilename(
@@ -813,14 +822,13 @@ class PointCloudViewer:
                 self.ring_buffer.clear()  
         imgui.separator()
         if imgui.button("Restart TCP Conn"):
-            self.restart_tcp_connection("192.168.137.1", 9000)
+            self.restart_tcp_connection(self.tcp_host, self.tcp_port)
         if imgui.button("Update ArUco"):
             with latest_transform_lock, global_transform_lock:
                 global_transform[:] = latest_transform_matrix.copy()
         if imgui.button("Exit App"):
             glfw.set_window_should_close(self.window, True)
         imgui.end_group()
-
         imgui.separator()
 
         # —— 第三部分：Global Map 操作 —— #
