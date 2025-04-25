@@ -377,11 +377,8 @@ class PointCloudViewer:
         self.tcp_port = 9000
         # 啟動 TCP 傳送（使用變數 self.tcp_host, self.tcp_port）
         if enable_network:
-            self.tcp_sender_thread = threading.Thread(
-                target=self.tcp_sender,
-                args=(self.tcp_host, self.tcp_port),
-                daemon=True)
-            self.tcp_sender_thread.start()
+            self._tcp_stop_event = threading.Event()
+            self.start_tcp_thread()
         # 定義預設的坐標系資訊，以 identity matrix 作為範例
         self.coordinate_system = {
             "matrix": list(pyrr.matrix44.create_identity(dtype=np.float32))
@@ -407,116 +404,111 @@ class PointCloudViewer:
         self.show_global = False            # 是否顯示 global 點雲
         self.global_color = (1.0, 1.0, 1.0, 1.0)  # 畫 global 點的單一顏色
 
+
+    def start_tcp_thread(self):
+        self._tcp_stop_event.clear()
+        self.tcp_sender_thread = threading.Thread(
+            target=self.tcp_sender,
+            daemon=True
+        )
+        self.tcp_sender_thread.start()
+
+
+    def restart_tcp_connection(self):
+        # 使用時從外部呼叫
+        print("TCP 傳送線程：正在重啟…")
+        # 先通知舊線程停止
+        self._tcp_stop_event.set()
+        # 等待舊線程結束
+        if self.tcp_sender_thread.is_alive():
+            self.tcp_sender_thread.join(timeout=3.0)
+        # 再啟動新線程
+        self.start_tcp_thread()
     
 
-    def tcp_sender(self, host, port):
+    def tcp_sender(self):
         import socket, time, struct, json
         import numpy as np
         global global_coords
 
+        stop_event = self._tcp_stop_event
+        host, port = self.tcp_host, self.tcp_port
 
-        while True:
-            # 嘗試連線
+        while not stop_event.is_set():
+            # —— 嘗試建立連線 —— #
             try:
                 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(5.0)  # 連線／send 最多等 5 秒
                 sock.connect((host, port))
+                sock.settimeout(None)
                 print(f"TCP Sender: 已連線至 {host}:{port}")
             except Exception as e:
-                print(f"TCP Sender 無法連線: {e}，2 秒後重試…")
+                print(f"TCP Sender 連線失敗: {e}，2 秒後重試…")
                 time.sleep(2)
                 continue
 
-            # 連線成功後持續送資料
-            while True:
-                        # 建一個純 Python dict，把所有 marker 的矩陣轉成 list
-                aruco_dict = {
-                    name: mat.tolist()
-                    for name, mat in global_coords.items()
-                    if name.startswith("marker_")}
-                # ► 準備要送的點雲資料（live / 檔案模式分支）
-                if self.send_mode == 0:
-                    # ► Live 模式
-                    with self.points_lock:
-                        pts = self.ring_buffer.get_recent_points(self.retention_seconds)
-                    pts3 = transform_point_cloud(pts, self.Lidar_T_Aruco)
-                    stamps = np.full((pts3.shape[0],1), time.time(), dtype=np.float32)
-                    data4 = np.hstack((pts3, stamps))
-                                    # 組裝座標系 JSON
-                    coord_system = {
-                        "lidar":  self.Lidar_Position,
-                        "camera": self.Camera_Position,
-                        "world":  self.Word_Point,
-                        #"aruco":  aruco_dict             # marker_{id}: 4×4 list of lists
-
-                    }
-
-                elif self.send_mode == 1:
-                    # ► Global 模式
-                    with global_lock:
-                        glob = global_pts[:global_size].copy()
-                    # global_pts 已经是在世界坐标系下的 xyz
-                    stamps = np.full((glob.shape[0],1), time.time(), dtype=np.float32)
-                    data4 = np.hstack((glob, stamps))
-                    # global_coords 裡頭 key = "world","camera","lidar","marker_1",…
-
-                    coord_system = {
-                        name: mat
-                        for name, mat in global_coords.items()
-                    }
-
-
-                else:  # self.send_mode == 2
-                    # ► File 模式（已有载入逻辑，直接把 loaded_points 用起来）
-                    mask = np.logical_and(
-                        self.loaded_points[:,3] >= self.file_time_start,
-                        self.loaded_points[:,3] <= self.file_time_end
-                    )
-                    pts = self.loaded_points[mask, :3].astype(np.float32)
-                    stamps = np.full((pts.shape[0],1), time.time(), dtype=np.float32)
-                    data4 = np.hstack((pts, stamps))
-                    coord_system = self.loaded_poses.copy()
-
-                # 拆出 XYZ bytes
-                 # 傳送 x,y,z,timestamp
-                points_bin = data4.astype(np.float32).tobytes()
-
-
-                coord_bin = json.dumps(coord_system, cls=NumpyEncoder).encode('utf-8')
-
-                # Header：coord 長度 + points 長度
-                header = struct.pack('<II', len(coord_bin), len(points_bin))
-                message = header + coord_bin + points_bin
-
-                # 傳送
-                try:
-                    sock.sendall(message)
-                except Exception as e:
-                    print(f"TCP Sender 傳送錯誤: {e}，將重新建立連線…")
-                    break
-
-                # 間隔 self.retention_seconds 秒
-                time.sleep(1)
-
-            # 若內層迴圈因錯誤跳出，關閉 socket、2 秒後再重連
+            # —— 連線成功後進入傳送迴圈 —— #
             try:
+                while not stop_event.is_set():
+                    # 準備 coord 系列
+                    coord_system = {
+                        name: mat.tolist()
+                        for name, mat in global_coords.items()
+                        if name.startswith("marker_")
+                    }
+                    # ► 準備要送的點雲資料（Live / Global / File）
+                    if self.send_mode == 0:
+                        with self.points_lock:
+                            pts = self.ring_buffer.get_recent_points(self.retention_seconds)
+                        pts3 = transform_point_cloud(pts, self.Lidar_T_Aruco)
+                        stamps = np.full((pts3.shape[0],1), time.time(), dtype=np.float32)
+                        data4 = np.hstack((pts3, stamps))
+                        coord_system = {
+                            "lidar":  self.Lidar_Position,
+                            "camera": self.Camera_Position,
+                            "world":  self.Word_Point,
+                        }
+                    elif self.send_mode == 1:
+                        with global_lock:
+                            glob = global_pts[:global_size].copy()
+                        stamps = np.full((glob.shape[0],1), time.time(), dtype=np.float32)
+                        data4 = np.hstack((glob, stamps))
+                        coord_system = {
+                            name: mat
+                            for name, mat in global_coords.items()
+                        }
+                    else:  # File 模式
+                        mask = np.logical_and(
+                            self.loaded_points[:,3] >= self.file_time_start,
+                            self.loaded_points[:,3] <= self.file_time_end
+                        )
+                        pts = self.loaded_points[mask, :3].astype(np.float32)
+                        stamps = np.full((pts.shape[0],1), time.time(), dtype=np.float32)
+                        data4 = np.hstack((pts, stamps))
+                        coord_system = self.loaded_poses.copy()
+
+                    # 拆出 XYZ + timestamp bytes
+                    points_bin = data4.astype(np.float32).tobytes()
+                    coord_bin = json.dumps(coord_system, cls=NumpyEncoder).encode('utf-8')
+
+                    # Header：coord 長度 + points 長度
+                    header = struct.pack('<II', len(coord_bin), len(points_bin))
+                    message = header + coord_bin + points_bin
+
+                    sock.sendall(message)
+                    time.sleep(1)
+
+            except Exception as e:
+                print(f"TCP Sender 傳送失敗: {e}，2 秒後重試…")
+                time.sleep(2)
+
+            finally:
                 sock.close()
-            except:
-                pass
-            print("TCP 連線已關閉，2 秒後嘗試重連…")
-            time.sleep(2)
+
+        print("TCP Sender 線程已停止")
 
 
 
-
-
-
-    def restart_tcp_connection(self, host, port):
-        if not hasattr(self, 'tcp_sender_thread') or not self.tcp_sender_thread.is_alive():
-            print("TCP 傳送線程已停止，正在重啟...")
-            self.tcp_sender_thread = threading.Thread(target=self.tcp_sender, args=(host, port), daemon=True)
-            self.tcp_sender_thread.start()
-        else:
-            print("TCP 傳送線程仍在運行。")
 
     def init_glfw(self):
         if not glfw.init():
@@ -862,7 +854,7 @@ class PointCloudViewer:
                 self.ring_buffer.clear()  
         imgui.separator()
         if imgui.button("Restart TCP Conn"):
-            self.restart_tcp_connection(self.tcp_host, self.tcp_port)
+             self.restart_tcp_connection()
         if imgui.button("Update ArUco"):
             with latest_transform_lock, global_transform_lock:
                 global_transform[:] = latest_transform_matrix.copy()

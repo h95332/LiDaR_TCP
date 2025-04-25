@@ -145,14 +145,13 @@ def recvall(sock, n):
 # TCPReceiver 類別：透過 TCP 接收點雲資料並存入環狀緩衝區
 # =============================================================================
 class TCPReceiver(threading.Thread):
-    def __init__(self, host, port, ring_buffer, lock):
+    def __init__(self, host, port, ring_buffer, lock, viewer=None):
         super().__init__(daemon=True)
         self.host = host
         self.port = port
         self.ring_buffer = ring_buffer
         self.lock = lock
-        self.viewer = None  # 加在 TCPReceiver 的 __init__ 中
-        
+        self.viewer = viewer
 
     def run(self):
         srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -160,56 +159,63 @@ class TCPReceiver(threading.Thread):
         srv.bind((self.host, self.port))
         srv.listen(1)
         print(f"TCP Receiver 監聽 {self.host}:{self.port}")
-        conn, addr = srv.accept()
-        print(f"TCP Receiver 已連線：{addr}")
 
         while True:
-            # 1. 讀取 8 bytes Header：
-            #    前 4 bytes 為座標系統資料長度，
-            #    後 4 bytes 為點雲資料位元組長度
-            header = recvall(conn, 8)
-            if header is None:
-                break
-            coord_length, points_length = struct.unpack('<II', header)
-
-            # 2. 讀取座標系統資料
-            coord_bytes = recvall(conn, coord_length)
-            if coord_bytes is None:
-                break
+            conn, addr = srv.accept()
+            print(f"TCP Receiver 已連線：{addr}")
             try:
-                coordinate_system = json.loads(coord_bytes.decode('utf-8'))
-            except Exception as e:
-                print(f"坐標系統資訊解碼錯誤: {e}")
-                continue  # 發生解碼錯誤則略過此封包
+                while True:
+                    # 1. 讀取 8-byte header
+                    header = self._recvall(conn, 8)
+                    if header is None:
+                        break
+                    coord_len, pts_len = struct.unpack('<II', header)
 
-            # 3. 讀取點雲資料
-            points_data = recvall(conn, points_length)
-            if points_data is None:
-                break
+                    # 2. 讀取並解碼座標系統 JSON
+                    coord_bytes = self._recvall(conn, coord_len)
+                    if coord_bytes is None:
+                        break
+                    try:
+                        coord_sys = json.loads(coord_bytes.decode('utf-8'))
+                    except Exception as e:
+                        print(f"坐標系統資訊解碼錯誤: {e}")
+                        continue
 
-            # 將點雲資料轉換成 NumPy 陣列（假設每筆點雲資料包含 x, y, z 為 float32）
-            pts = np.frombuffer(points_data, dtype=np.float32).reshape(-1, 3).astype(np.float64)
-            t_now = time.time()
-            # 為每個點附加當前時間戳（轉為 float64 以確保精度）
-            timestamps = np.full((pts.shape[0], 1), t_now, dtype=np.float64)
-            new_points = np.hstack((pts, timestamps))
+                    # 3. 讀取點雲資料（每筆 x,y,z,timestamp 共 4 floats）
+                    pts_bytes = self._recvall(conn, pts_len)
+                    if pts_bytes is None:
+                        break
+                    pts4 = np.frombuffer(pts_bytes, dtype=np.float32).reshape(-1, 4).astype(np.float64)
 
-            with self.lock:
-                self.ring_buffer.add_points(new_points)
+                    # 4. 存入環狀緩衝
+                    with self.lock:
+                        self.ring_buffer.add_points(pts4)
 
-            # 儲存遠端矩陣（需要 3 個皆為 4x4 list）
-            # try:
-            if self.viewer:
-                self.viewer.remote_coordinate_system = {
-                    k: np.array(v, dtype=np.float32)
-                    for k, v in coordinate_system.items()
-                    if isinstance(v, list) and np.array(v).shape == (4, 4)
-                }
-            # except Exception as e:
-            #     print(f"轉換座標系統資料錯誤: {e}")
+                    # 5. 更新遠端座標系統
+                    if self.viewer:
+                        mats = {}
+                        for k, v in coord_sys.items():
+                            arr = np.array(v, dtype=np.float32)
+                            if arr.shape == (4, 4):
+                                mats[k] = arr
+                        self.viewer.remote_coordinate_system = mats
 
-            # 通知主迴圈有新資料可用於重繪
-            glfw.post_empty_event()
+                    # 6. 通知主迴圈重繪
+                    glfw.post_empty_event()
+
+            finally:
+                conn.close()
+                print("TCP Receiver: client 已斷線，等待下次連線…")
+
+    @staticmethod
+    def _recvall(sock, n):
+        data = b''
+        while len(data) < n:
+            packet = sock.recv(n - len(data))
+            if not packet:
+                return None
+            data += packet
+        return data
 
 
 # =============================================================================
