@@ -404,6 +404,11 @@ class PointCloudViewer:
         self.show_global = False            # 是否顯示 global 點雲
         self.global_color = (1.0, 1.0, 1.0, 1.0)  # 畫 global 點的單一顏色
 
+        # 在 __init__ 中加入（設定預設為 ±5m 的 3D 空間）
+        self.fence_min = np.array([-5.0, -5.0, -1.0], dtype=np.float32)
+        self.fence_max = np.array([ 5.0,  5.0,  3.0], dtype=np.float32)
+        self.use_fence = True  # 控制是否啟用電子圍籬
+
 
     def start_tcp_thread(self):
         self._tcp_stop_event.clear()
@@ -460,8 +465,8 @@ class PointCloudViewer:
                     if self.send_mode == 0:
                         with self.points_lock:
                             pts = self.ring_buffer.get_recent_points(self.retention_seconds)
-                        pts3 = transform_point_cloud(pts, self.Lidar_T_Aruco)
-                        stamps = np.full((pts3.shape[0],1), time.time(), dtype=np.float32)
+                        pts3, ts = self.get_latest_live_points()
+                        stamps = np.full((pts3.shape[0],1), ts, dtype=np.float32)
                         data4 = np.hstack((pts3, stamps))
                         coord_system = {
                             "lidar":  self.Lidar_Position,
@@ -506,6 +511,28 @@ class PointCloudViewer:
                 sock.close()
 
         print("TCP Sender 線程已停止")
+
+    def get_latest_live_points(self):
+        """取得經 ArUco 轉換後的即時點雲資料（含電子圍籬）與時間戳"""
+        with self.points_lock:
+            pts = self.ring_buffer.get_recent_points(self.retention_seconds)
+
+        with global_transform_lock:
+            Camera_T_Aruco = global_transform.copy()
+        self.Lidar_T_Aruco = np.linalg.inv(Cam_T_Lidar) @ Camera_T_Aruco
+        pts3 = transform_point_cloud(pts, self.Lidar_T_Aruco)
+
+        # ✅ 電子圍籬過濾 (僅限 Live 模式)
+        if self.use_fence:
+            mask = np.all((pts3 >= self.fence_min) & (pts3 <= self.fence_max), axis=1)
+            pts3 = pts3[mask]
+
+        # 更新姿態資訊
+        self.Word_Point      = np.eye(4, dtype=np.float32)
+        self.Camera_Position = np.linalg.inv(Camera_T_Aruco)
+        self.Lidar_Position  = self.Camera_Position @ Cam_T_Lidar
+
+        return pts3, time.time()
 
 
 
@@ -716,7 +743,7 @@ class PointCloudViewer:
                 Camera_T_Aruco = global_transform.copy()
             # LiDAR 到 ArUco 的複合變換
             self.Lidar_T_Aruco = np.linalg.inv(Cam_T_Lidar) @ Camera_T_Aruco
-            pts_array = transform_point_cloud(pts_array, self.Lidar_T_Aruco)
+            pts_array, _ = self.get_latest_live_points()
             # 動態座標系 (ArUco → Camera & LiDAR)
             self.Word_Point      = np.eye(4, dtype=np.float32)
             self.Camera_Position = np.linalg.inv(Camera_T_Aruco)
@@ -816,6 +843,11 @@ class PointCloudViewer:
             "Max distance", self.max_distance, 1.0, 20.0)
         changed, self.use_live_data = imgui.checkbox(
             "Live Mode", self.use_live_data)
+        _, self.use_fence = imgui.checkbox("Enable Fence", self.use_fence)
+        imgui.text("Fence Min:")
+        _, self.fence_min = imgui.input_float3("##minfence", *self.fence_min)
+        imgui.text("Fence Max:")
+        _, self.fence_max = imgui.input_float3("##maxfence", *self.fence_max)
         imgui.end_group()
 
         imgui.same_line()
