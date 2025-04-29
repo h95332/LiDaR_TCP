@@ -213,18 +213,29 @@ class PointRingBuffer:
         self.index = (self.index + n) % self.max_points
         self.size = min(self.size + n, self.max_points)
 
-    def get_recent_points(self, retention_time):
+    def get_recent_points(self, retention_time, with_time=False):
         if self.size == 0:
-            return np.empty((0, 3), dtype=np.float32)
+            if with_time:
+                return np.empty((0, 4), dtype=np.float32)
+            else:
+                return np.empty((0, 3), dtype=np.float32)
+
         now = time.time()
         cutoff = now - retention_time
+
         if self.size < self.max_points:
             data = self.buffer[:self.size]
         else:
-            data = np.roll(self.buffer, -self.index, axis=0)
+            data = np.vstack((self.buffer[self.index:], self.buffer[:self.index]))
+
         idx = np.searchsorted(data[:, 3], cutoff, side='left')
-        valid = data[idx:, :3]
-        return valid.astype(np.float32)
+        valid = data[idx:]
+
+        if with_time:
+            return valid  # (N, 4)
+        else:
+            return valid[:, :3]  # (N, 3)
+
 
     def clear(self):
         self.buffer[:] = 0
@@ -358,6 +369,9 @@ class PointCloudViewer:
         # 0 = Live, 1 = Global, 2 = File
         self.send_mode = 0
         self.save_source = 0
+        
+        self.last_live_fetch_time = 0.0
+        self.live_pts_cache = (np.empty((0, 3), np.float32), np.empty((0, 1), np.float32))
 
         # 啟動 UDP 接收線程
         if enable_network:
@@ -369,6 +383,7 @@ class PointCloudViewer:
         self.init_imgui()
         self.init_shaders()
         self.init_buffers()
+        self._axis_vao_cache = {}  # cache for reused axis
 
         # 啟動 TCP 傳送（此處示例連線至指定的 IP 與埠）
         # 初始化可調整的 TCP/IP 參數
@@ -465,8 +480,8 @@ class PointCloudViewer:
                     if self.send_mode == 0:
                         with self.points_lock:
                             pts = self.ring_buffer.get_recent_points(self.retention_seconds)
-                        pts3, ts = self.get_latest_live_points()
-                        stamps = np.full((pts3.shape[0],1), ts, dtype=np.float32)
+                        pts3, stamps = self.get_latest_live_points()  # stamps 是 (N,1)
+                        data4 = np.hstack((pts3, stamps))
                         data4 = np.hstack((pts3, stamps))
                         coord_system = {
                             "lidar":  self.Lidar_Position,
@@ -494,6 +509,7 @@ class PointCloudViewer:
 
                     # 拆出 XYZ + timestamp bytes
                     points_bin = data4.astype(np.float32).tobytes()
+                    print(len(data4))
                     coord_bin = json.dumps(coord_system, cls=NumpyEncoder).encode('utf-8')
 
                     # Header：coord 長度 + points 長度
@@ -513,26 +529,58 @@ class PointCloudViewer:
         print("TCP Sender 線程已停止")
 
     def get_latest_live_points(self):
-        """取得經 ArUco 轉換後的即時點雲資料（含電子圍籬）與時間戳"""
+        """取得經 ArUco 轉換後的即時點雲資料（以 LiDAR 當中心電子圍籬）"""
+        now = time.time()
+        if now - self.last_live_fetch_time < 0.2:  # 每 0.2秒更新一次
+            return self.live_pts_cache
+
         with self.points_lock:
-            pts = self.ring_buffer.get_recent_points(self.retention_seconds)
+            pts_full = self.ring_buffer.get_recent_points(self.retention_seconds, with_time=True)
+
+        if pts_full.size == 0:
+            self.live_pts_cache = (np.empty((0, 3), dtype=np.float32), np.empty((0, 1), dtype=np.float32))
+            self.last_live_fetch_time = now
+            return self.live_pts_cache
+
+        pts_xyz = pts_full[:, :3]
+        pts_time = pts_full[:, 3:4]
 
         with global_transform_lock:
             Camera_T_Aruco = global_transform.copy()
-        self.Lidar_T_Aruco = np.linalg.inv(Cam_T_Lidar) @ Camera_T_Aruco
-        pts3 = transform_point_cloud(pts, self.Lidar_T_Aruco)
 
-        # ✅ 電子圍籬過濾 (僅限 Live 模式)
-        if self.use_fence:
-            mask = np.all((pts3 >= self.fence_min) & (pts3 <= self.fence_max), axis=1)
-            pts3 = pts3[mask]
-
-        # 更新姿態資訊
-        self.Word_Point      = np.eye(4, dtype=np.float32)
+        # 🔥 先更新 Camera_Position 和 Lidar_Position
         self.Camera_Position = np.linalg.inv(Camera_T_Aruco)
         self.Lidar_Position  = self.Camera_Position @ Cam_T_Lidar
 
-        return pts3, time.time()
+        # 然後建立 LiDAR 到 ArUco 世界座標的變換
+        self.Lidar_T_Aruco = np.linalg.inv(Cam_T_Lidar) @ Camera_T_Aruco
+
+        # 然後轉換點雲
+        pts3 = transform_point_cloud(pts_xyz, self.Lidar_T_Aruco)
+
+        # 🔥 轉成 LiDAR 局部座標
+        if self.Lidar_Position is None:
+            lidar_inv = np.eye(4, dtype=np.float32)
+        else:
+            lidar_inv = np.linalg.inv(self.Lidar_Position)
+
+        ones = np.ones((pts3.shape[0], 1), dtype=np.float32)
+        pts3_hom = np.hstack((pts3, ones))  # (N,4)
+        pts3_local = (lidar_inv @ pts3_hom.T).T[:, :3]  # (N,3)，轉到LiDAR自身座標系
+
+        # ✅ 電子圍籬篩選
+        if self.use_fence and pts3_local.shape[0] > 0:
+            mask = np.all((pts3_local >= self.fence_min) & (pts3_local <= self.fence_max), axis=1)
+            pts3 = pts3[mask]
+            pts_time = pts_time[mask]
+
+        # 更新 cache
+        self.live_pts_cache = (pts3, pts_time)
+        self.last_live_fetch_time = now
+        return self.live_pts_cache
+
+
+
 
 
 
@@ -1004,8 +1052,8 @@ class PointCloudViewer:
 
         # 先轉 XYZ，再把 timestamp 併回
         pts_xyz = transform_point_cloud(pts, Lidar_T_Aruco)
-        ts = np.full((pts_xyz.shape[0], 1), time.time(), dtype=np.float32)
-        data4   = np.hstack((pts_xyz, ts))  # shape=(N,4)
+        pts3, stamps = self.get_latest_live_points()
+        data4 = np.hstack((pts3, stamps))
 
         # PLY header，新增 timestamp 屬性
         header_lines = [
@@ -1096,41 +1144,45 @@ class PointCloudViewer:
         if colors is None:
             colors = [(1, 0, 0), (0, 1, 0), (0, 0, 1)]  # 預設 RGB
 
+        key = tuple(matrix.flatten()) + (scale,)
+        vao, vertex_count = self._axis_vao_cache.get(key, (None, 0))
+
+        if vao is None:
+            origin = matrix[:3, 3]
+            x_axis = origin + matrix[:3, 0] * scale
+            y_axis = origin + matrix[:3, 1] * scale
+            z_axis = origin + matrix[:3, 2] * scale
+
+            vertices = np.array([
+                *origin, *x_axis,
+                *origin, *y_axis,
+                *origin, *z_axis
+            ], dtype=np.float32)
+
+            vao = glGenVertexArrays(1)
+            vbo = glGenBuffers(1)
+            glBindVertexArray(vao)
+            glBindBuffer(GL_ARRAY_BUFFER, vbo)
+            glBufferData(GL_ARRAY_BUFFER, vertices.nbytes, vertices, GL_STATIC_DRAW)
+            glEnableVertexAttribArray(0)
+            glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 0, None)
+            glBindVertexArray(0)
+            vertex_count = 6
+            self._axis_vao_cache[key] = (vao, vertex_count)
+
         glUseProgram(self.shader_program)
-        origin = matrix[:3, 3]
-        x_axis = origin + matrix[:3, 0] * scale
-        y_axis = origin + matrix[:3, 1] * scale
-        z_axis = origin + matrix[:3, 2] * scale
-
-        vertices = np.array([
-            *origin, *x_axis,  # X 軸
-            *origin, *y_axis,  # Y 軸
-            *origin, *z_axis   # Z 軸
-        ], dtype=np.float32)
-
-        vao = glGenVertexArrays(1)
-        vbo = glGenBuffers(1)
         glBindVertexArray(vao)
-        glBindBuffer(GL_ARRAY_BUFFER, vbo)
-        glBufferData(GL_ARRAY_BUFFER, vertices.nbytes, vertices, GL_STATIC_DRAW)
-        glEnableVertexAttribArray(0)
-        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 0, None)
-
         glLineWidth(3.0)
         glUniform1i(glGetUniformLocation(self.shader_program, "useUniformColor"), 1)
-
-        # 為每條軸設置不同顏色
         glUniform4f(glGetUniformLocation(self.shader_program, "uColor"), *colors[0], 1)
         glDrawArrays(GL_LINES, 0, 2)
         glUniform4f(glGetUniformLocation(self.shader_program, "uColor"), *colors[1], 1)
         glDrawArrays(GL_LINES, 2, 2)
         glUniform4f(glGetUniformLocation(self.shader_program, "uColor"), *colors[2], 1)
         glDrawArrays(GL_LINES, 4, 2)
-
         glBindVertexArray(0)
-        glDeleteVertexArrays(1, [vao])
-        glDeleteBuffers(1, [vbo])
         glLineWidth(1.0)
+
 
     def load_ply_with_pose(self, filepath: str):
         if not os.path.exists(filepath):

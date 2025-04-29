@@ -55,7 +55,13 @@ class PointRingBuffer:
         # 使用二分搜尋取得符合保留時間條件的點（只取 x,y,z）
         idx = np.searchsorted(data[:, 3], cutoff, side='left')
         valid = data[idx:, :3]
+        print(">>> [DEBUG] 現在時間:", time.time())
+        print(">>> [DEBUG] 資料 timestamp 前幾筆:", data[:5, 3])
+        print(">>> [DEBUG] retention_time 設定為:", retention_time)
+        print(">>> [DEBUG] cutoff 時間 = ", cutoff)
+        print(">>> [DEBUG] 通過條件的點數 = ", valid.shape[0])
         return valid.astype(np.float32)
+    
 
 
     def clear(self):
@@ -152,26 +158,32 @@ class TCPReceiver(threading.Thread):
         self.ring_buffer = ring_buffer
         self.lock = lock
         self.viewer = viewer
+        self._stop_event = threading.Event()
+        self.server_socket = None
 
     def run(self):
-        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        srv.bind((self.host, self.port))
-        srv.listen(1)
+        self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.server_socket.bind((self.host, self.port))
+        self.server_socket.listen(1)
         print(f"TCP Receiver 監聽 {self.host}:{self.port}")
 
-        while True:
-            conn, addr = srv.accept()
+        while not self._stop_event.is_set():
+            try:
+                self.server_socket.settimeout(1.0)
+                conn, addr = self.server_socket.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+
             print(f"TCP Receiver 已連線：{addr}")
             try:
-                while True:
-                    # 1. 讀取 8-byte header
+                while not self._stop_event.is_set():
                     header = self._recvall(conn, 8)
                     if header is None:
                         break
                     coord_len, pts_len = struct.unpack('<II', header)
-
-                    # 2. 讀取並解碼座標系統 JSON
                     coord_bytes = self._recvall(conn, coord_len)
                     if coord_bytes is None:
                         break
@@ -181,17 +193,13 @@ class TCPReceiver(threading.Thread):
                         print(f"坐標系統資訊解碼錯誤: {e}")
                         continue
 
-                    # 3. 讀取點雲資料（每筆 x,y,z,timestamp 共 4 floats）
                     pts_bytes = self._recvall(conn, pts_len)
                     if pts_bytes is None:
                         break
                     pts4 = np.frombuffer(pts_bytes, dtype=np.float32).reshape(-1, 4).astype(np.float64)
-
-                    # 4. 存入環狀緩衝
                     with self.lock:
                         self.ring_buffer.add_points(pts4)
 
-                    # 5. 更新遠端座標系統
                     if self.viewer:
                         mats = {}
                         for k, v in coord_sys.items():
@@ -199,19 +207,29 @@ class TCPReceiver(threading.Thread):
                             if arr.shape == (4, 4):
                                 mats[k] = arr
                         self.viewer.remote_coordinate_system = mats
-
-                    # 6. 通知主迴圈重繪
                     glfw.post_empty_event()
-
+            except Exception as e:
+                print(f"TCP 接收錯誤：{e}")
             finally:
                 conn.close()
                 print("TCP Receiver: client 已斷線，等待下次連線…")
+
+    def stop(self):
+        self._stop_event.set()
+        if self.server_socket:
+            try:
+                self.server_socket.close()
+            except Exception:
+                pass
 
     @staticmethod
     def _recvall(sock, n):
         data = b''
         while len(data) < n:
-            packet = sock.recv(n - len(data))
+            try:
+                packet = sock.recv(n - len(data))
+            except socket.error:
+                return None
             if not packet:
                 return None
             data += packet
@@ -417,14 +435,16 @@ class PointCloudViewer:
     
     def restart_tcp_receiver(self, host="0.0.0.0", port=9000):
         if hasattr(self, 'tcp_receiver') and self.tcp_receiver.is_alive():
-            print("TCP 接收執行緒仍在運行，將嘗試重新啟動...")
-            # 如果原執行緒還在，嘗試關閉 socket，讓執行緒終止（這部分可視情況補強）
-            # 簡單做法是直接跳過它，啟動新的執行緒
+            print("正在停止舊的 TCP Receiver...")
+            self.tcp_receiver.stop()
+            self.tcp_receiver.join()
+            print("舊的 TCP Receiver 已停止")
 
-        self.tcp_receiver = TCPReceiver(host, port, self.ring_buffer, self.points_lock)
-        self.tcp_receiver.viewer = self
+        print("重新啟動 TCP Receiver 中...")
+        self.tcp_receiver = TCPReceiver(host, port, self.ring_buffer, self.points_lock, viewer=self)
         self.tcp_receiver.start()
-        print("TCP 接收已重新啟動")
+        print("新的 TCP Receiver 已啟動")
+
 
 
 
