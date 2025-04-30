@@ -581,10 +581,6 @@ class PointCloudViewer:
 
 
 
-
-
-
-
     def init_glfw(self):
         if not glfw.init():
             raise Exception("GLFW 初始化失敗")
