@@ -33,9 +33,16 @@ def build_transform(tx, ty, tz, yaw_deg=0.0, pitch_deg=0.0, roll_deg=0.0):
 
 GLOBAL_TO_MARKER = {
     0: np.eye(4, dtype=np.float32),              # id 0 為世界原點
-    1: build_transform(0.000, -5.00, 0.000),     # 以下請依手動量測填值
-    #2: build_transform(0.000, -5.0, 0.000),
-    #3: build_transform(5.000, 0.0, 0.000),
+    1: build_transform(0.00, 1.00, 0.00),     # 以下請依手動量測填值
+    2: build_transform(0.00, 2.00, 0.000),
+    3: build_transform(0.00, 3.00, 0.000),
+    4: build_transform(0.00, 4.00, 0.000),
+    5: build_transform(0.00, 4.00, 0.000),
+    6: build_transform(0.00, 6.00, 0.000),
+    7: build_transform(0.00, 7.00, 0.000),
+    8: build_transform(0.00, 8.00, 0.000),
+    9: build_transform(0.00, 9.00, 0.000),
+    10: build_transform(0.00, 10.00, 0.000),
     # …持續新增
 }
 
@@ -420,8 +427,8 @@ class PointCloudViewer:
         self.global_color = (1.0, 1.0, 1.0, 1.0)  # 畫 global 點的單一顏色
 
         # 在 __init__ 中加入（設定預設為 ±5m 的 3D 空間）
-        self.fence_min = np.array([-5.0, -5.0, -1.0], dtype=np.float32)
-        self.fence_max = np.array([ 5.0,  5.0,  3.0], dtype=np.float32)
+        self.fence_min = np.array([-1.0, -1.0, 0.0], dtype=np.float32)
+        self.fence_max = np.array([ 1.0,  1.0,  1.7], dtype=np.float32)
         self.use_fence = True  # 控制是否啟用電子圍籬
 
 
@@ -570,7 +577,8 @@ class PointCloudViewer:
 
         # ✅ 電子圍籬篩選
         if self.use_fence and pts3_local.shape[0] > 0:
-            mask = np.all((pts3_local >= self.fence_min) & (pts3_local <= self.fence_max), axis=1)
+            #mask = np.all((pts3_local >= self.fence_min) & (pts3_local <= self.fence_max), axis=1)
+            mask = ~np.all((pts3_local >= self.fence_min) & (pts3_local <= self.fence_max), axis=1)
             pts3 = pts3[mask]
             pts_time = pts_time[mask]
 
@@ -1257,6 +1265,26 @@ class PointCloudViewer:
               f"時間範圍：{self.file_time_min:.3f} – {self.file_time_max:.3f}，"
               f"解析到坐標系：{list(self.loaded_poses.keys())}")
 
+class ArUcoTransformReceiver(threading.Thread):
+    def __init__(self, udp_port=9002):
+        super().__init__(daemon=True)
+        self.port = udp_port
+
+    def run(self):
+        global global_transform
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.bind(("0.0.0.0", self.port))
+        print(f"ArUco 接收埠開啟：UDP {self.port}")
+        while True:
+            try:
+                data, _ = sock.recvfrom(4096)
+                obj = json.loads(data.decode("utf-8"))
+                matrix = np.array(obj["T"], dtype=np.float32).reshape((4, 4))
+                with global_transform_lock:
+                    latest_transform_matrix[:] = matrix
+                print(f"✅ 接收到 ArUco: marker {obj['id']}")
+            except Exception as e:
+                print(f"❌ 解析 ArUco UDP 失敗: {e}")
 
 
 # =============================================================================
@@ -1264,9 +1292,11 @@ class PointCloudViewer:
 # 先啟動 ArUco 偵測線程，再建立並運行點雲視覺化應用
 # =============================================================================
 if __name__ == '__main__':
-    aruco_thread = threading.Thread(target=detect_aruco_thread, args=(0,), daemon=True)
-    aruco_thread.start()
-
+    # aruco_thread = threading.Thread(target=detect_aruco_thread, args=(0,), daemon=True)
+    # aruco_thread.start()
+    # ✅ 啟動遠端 UDP ArUco 接收線程
+    aruco_recv_thread = ArUcoTransformReceiver(udp_port=9002)
+    aruco_recv_thread.start()
     live_view   = PointCloudViewer()
 
     while not glfw.window_should_close(live_view.window):
