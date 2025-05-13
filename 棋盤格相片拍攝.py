@@ -8,7 +8,7 @@ if not os.path.exists(save_path):
     os.makedirs(save_path)
 
 # 使用第一個攝像頭，並指定使用 DirectShow
-cap = cv2.VideoCapture(1, cv2.CAP_DSHOW)
+cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
 
 if not cap.isOpened():
     print("無法開啟攝像頭")
@@ -17,7 +17,7 @@ if not cap.isOpened():
 # 設定攝像頭解析度
 cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
-cap.set(cv2.CAP_PROP_ZOOM, 200)
+cap.set(cv2.CAP_PROP_ZOOM, 100)
 cap.set(cv2.CAP_PROP_EXPOSURE,-6)
 cap.set(cv2.CAP_PROP_GAIN, 3)
 cap.set(cv2.CAP_PROP_SETTINGS, 1)

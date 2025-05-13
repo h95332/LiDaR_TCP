@@ -429,7 +429,11 @@ class PointCloudViewer:
         # 在 __init__ 中加入（設定預設為 ±5m 的 3D 空間）
         self.fence_min = np.array([-1.0, -1.0, 0.0], dtype=np.float32)
         self.fence_max = np.array([ 1.0,  1.0,  1.7], dtype=np.float32)
-        self.use_fence = True  # 控制是否啟用電子圍籬
+        self.use_inner_fence  = True  # 控制是否啟用電子圍籬
+        
+        self.use_outer_fence = False  # 新增的 Outer Fence
+        self.fence_outer_min = np.array([-3.0, -3.0, -1.0], dtype=np.float32)
+        self.fence_outer_max = np.array([ 3.0,  3.0,  3.0], dtype=np.float32)
 
 
     def start_tcp_thread(self):
@@ -575,12 +579,24 @@ class PointCloudViewer:
         pts3_hom = np.hstack((pts3, ones))  # (N,4)
         pts3_local = (lidar_inv @ pts3_hom.T).T[:, :3]  # (N,3)，轉到LiDAR自身座標系
 
-        # ✅ 電子圍籬篩選
-        if self.use_fence and pts3_local.shape[0] > 0:
-            #mask = np.all((pts3_local >= self.fence_min) & (pts3_local <= self.fence_max), axis=1)
-            mask = ~np.all((pts3_local >= self.fence_min) & (pts3_local <= self.fence_max), axis=1)
+        # # ✅ 電子圍籬篩選
+        # if self.use_fence and pts3_local.shape[0] > 0:
+        #     #mask = np.all((pts3_local >= self.fence_min) & (pts3_local <= self.fence_max), axis=1)
+        #     mask = ~np.all((pts3_local >= self.fence_min) & (pts3_local <= self.fence_max), axis=1)
+        #     pts3 = pts3[mask]
+        #     pts_time = pts_time[mask]
+
+        if pts3_local.shape[0] > 0:
+            mask = np.ones((pts3_local.shape[0],), dtype=bool)
+            if self.use_inner_fence:
+                inner_mask = np.all((pts3_local >= self.fence_min) & (pts3_local <= self.fence_max), axis=1)
+                mask &= ~inner_mask  # 把範圍內的剔除
+            if self.use_outer_fence:
+                outer_mask = np.all((pts3_local >= self.fence_outer_min) & (pts3_local <= self.fence_outer_max), axis=1)
+                mask &= outer_mask  # 只保留範圍內的
             pts3 = pts3[mask]
             pts_time = pts_time[mask]
+
 
         # 更新 cache
         self.live_pts_cache = (pts3, pts_time)
@@ -895,7 +911,12 @@ class PointCloudViewer:
             "Max distance", self.max_distance, 1.0, 20.0)
         changed, self.use_live_data = imgui.checkbox(
             "Live Mode", self.use_live_data)
-        _, self.use_fence = imgui.checkbox("Enable Fence", self.use_fence)
+        _, self.use_inner_fence = imgui.checkbox("Enable Inner Fence", self.use_inner_fence)
+        _, self.use_outer_fence = imgui.checkbox("Enable Outer Fence", self.use_outer_fence)
+        imgui.text("Outer Fence Min:")
+        _, self.fence_outer_min = imgui.input_float3("##outerminfence", *self.fence_outer_min)
+        imgui.text("Outer Fence Max:")
+        _, self.fence_outer_max = imgui.input_float3("##outermaxfence", *self.fence_outer_max)
         imgui.text("Fence Min:")
         _, self.fence_min = imgui.input_float3("##minfence", *self.fence_min)
         imgui.text("Fence Max:")
@@ -1286,6 +1307,45 @@ class ArUcoTransformReceiver(threading.Thread):
             except Exception as e:
                 print(f"❌ 解析 ArUco UDP 失敗: {e}")
 
+import cv2
+import threading
+
+def gstreamer_receiver_thread(stop_event=None):
+    gst_str = (
+        'udpsrc port=5000 caps="application/x-rtp, media=video, '
+        'clock-rate=90000, encoding-name=H264" ! '
+        'rtph264depay ! avdec_h264 ! videoconvert ! appsink drop=1 sync=false'
+    )
+
+    cap = cv2.VideoCapture(gst_str, cv2.CAP_GSTREAMER)
+    if not cap.isOpened():
+        print("❌ 無法開啟 GStreamer 視訊串流")
+        return
+
+    print("✅ 開始接收 GStreamer 串流（按下 Q 或 ESC 離開）")
+    
+    try:
+        while stop_event is None or not stop_event.is_set():
+            ret, frame = cap.read()
+            if not ret:
+                print("⚠️ 無法讀取串流影像")
+                continue
+
+            # 可根據需要縮放顯示影像
+            # frame = cv2.resize(frame, (640, 480))
+            cv2.imshow("Camera Stream", frame)
+
+            key = cv2.waitKey(1)
+            if key == 27 or key == ord('q'):  # ESC 或 q 鍵
+                print("🛑 使用者中止串流")
+                break
+    except Exception as e:
+        print(f"❌ 發生例外錯誤：{e}")
+    finally:
+        cap.release()
+        cv2.destroyAllWindows()
+
+
 
 # =============================================================================
 # 程式進入點：
@@ -1294,9 +1354,10 @@ class ArUcoTransformReceiver(threading.Thread):
 if __name__ == '__main__':
     # aruco_thread = threading.Thread(target=detect_aruco_thread, args=(0,), daemon=True)
     # aruco_thread.start()
-    # ✅ 啟動遠端 UDP ArUco 接收線程
+    # ✅ 啟動遠端 UDP ArUco 接收線程))
     aruco_recv_thread = ArUcoTransformReceiver(udp_port=9002)
     aruco_recv_thread.start()
+    threading.Thread(target=gstreamer_receiver_thread, daemon=True).start()
     live_view   = PointCloudViewer()
 
     while not glfw.window_should_close(live_view.window):
