@@ -34,15 +34,15 @@ def build_transform(tx, ty, tz, yaw_deg=0.0, pitch_deg=0.0, roll_deg=0.0):
 GLOBAL_TO_MARKER = {
     0: np.eye(4, dtype=np.float32),              # id 0 為世界原點
     1: build_transform(0.00, 1.00, 0.00),     # 以下請依手動量測填值
-    2: build_transform(0.00, 2.00, 0.000),
-    3: build_transform(0.00, 3.00, 0.000),
-    4: build_transform(0.00, 4.00, 0.000),
+    2: build_transform(0.00, 1.00, 0.000),
+    3: build_transform(0.00, 2.00, 0.000),
+    4: build_transform(0.00, 3.00, 0.000),
     5: build_transform(0.00, 4.00, 0.000),
-    6: build_transform(0.00, 6.00, 0.000),
-    7: build_transform(0.00, 7.00, 0.000),
+    6: build_transform(0.00, 5.00, 0.000),
+    7: build_transform(0.00, 6.00, 0.000),
     8: build_transform(0.00, 8.00, 0.000),
-    9: build_transform(0.00, 9.00, 0.000),
-    10: build_transform(0.00, 10.00, 0.000),
+    9: build_transform(0.00, 10.00, 0.000),
+    10: build_transform(0.00, 12.00, 0.000),
     # …持續新增
 }
 
@@ -187,12 +187,29 @@ Rz = np.array([
     [0,      0,     0, 1]
 ], dtype=np.float32)
 
+
+theta_x = np.radians(-25.0)                # 30°
+cos_x, sin_x = np.cos(theta_x), np.sin(theta_x)
+
+Rx = np.array([
+    [1,     0,      0, 0],
+    [0, cos_x, -sin_x, 0],
+    [0, sin_x,  cos_x, 0],
+    [0,     0,      0, 1]
+], dtype=np.float32)
+
+# 3. 組合旋轉矩陣
+#    ⬇️ 依「先 X、再 Z」的次序
+#    若希望先 Z 再 X，請改成 Rz @ Rx
+# ──────────────────────────────
+R = Rx @ Rz          # 先對 X 轉 30°，再對 Z 轉 -67.5°
+
 # 平移矩陣
 T = np.eye(4, dtype=np.float32)
 T[:3, 3] = [dx, dy, dz]
 
 # Camera to LiDAR 的外參（先旋轉再平移）
-Cam_T_Lidar = T @ Rz
+Cam_T_Lidar = T @ R
 
 # =============================================================================
 # PointRingBuffer 類別：環狀點雲資料緩衝區
@@ -200,7 +217,7 @@ Cam_T_Lidar = T @ Rz
 class PointRingBuffer:
     def __init__(self, max_points):
         self.max_points = max_points
-        self.buffer = np.zeros((max_points, 4), dtype=np.float64)  # 存 (x,y,z,timestamp)
+        self.buffer = np.zeros((max_points, 4), dtype=np.float32)  # 存 (x,y,z,timestamp)
         self.index = 0
         self.size = 0
 
@@ -227,7 +244,7 @@ class PointRingBuffer:
             else:
                 return np.empty((0, 3), dtype=np.float32)
 
-        now = time.time()
+        now = time.monotonic()
         cutoff = now - retention_time
 
         if self.size < self.max_points:
@@ -273,9 +290,9 @@ class UDPReceiver(threading.Thread):
             if len(data) != expected_size:
                 continue
             floats = struct.unpack('<' + 'f' * (num_points * 3), data[4:])
-            pts = np.array(floats, dtype=np.float64).reshape(-1, 3)
-            t_now = time.time()
-            timestamps = np.full((pts.shape[0], 1), t_now, dtype=np.float64)
+            pts = np.array(floats, dtype=np.float32).reshape(-1, 3)
+            t_now = time.monotonic()
+            timestamps = np.full((pts.shape[0], 1), t_now, dtype=np.float32)
             new_points = np.hstack((pts, timestamps))
             with self.lock:
                 self.ring_buffer.add_points(new_points)
@@ -286,9 +303,9 @@ class NumpyEncoder(json.JSONEncoder):
     def default(self, obj):
         if isinstance(obj, np.ndarray):
             return obj.tolist()  # 把 numpy 矩陣轉成 list
-        elif isinstance(obj, (np.float32, np.float64)):
+        elif isinstance(obj, (np.float32, np.float32)):
             return float(obj)
-        elif isinstance(obj, (np.int32, np.int64)):
+        elif isinstance(obj, (np.int32, np.int32)):
             return int(obj)
         return super().default(obj)
 
@@ -493,7 +510,6 @@ class PointCloudViewer:
                             pts = self.ring_buffer.get_recent_points(self.retention_seconds)
                         pts3, stamps = self.get_latest_live_points()  # stamps 是 (N,1)
                         data4 = np.hstack((pts3, stamps))
-                        data4 = np.hstack((pts3, stamps))
                         coord_system = {
                             "lidar":  self.Lidar_Position,
                             "camera": self.Camera_Position,
@@ -502,7 +518,7 @@ class PointCloudViewer:
                     elif self.send_mode == 1:
                         with global_lock:
                             glob = global_pts[:global_size].copy()
-                        stamps = np.full((glob.shape[0],1), time.time(), dtype=np.float32)
+                        stamps = np.full((glob.shape[0],1), time.monotonic(), dtype=np.float32)
                         data4 = np.hstack((glob, stamps))
                         coord_system = {
                             name: mat
@@ -514,13 +530,12 @@ class PointCloudViewer:
                             self.loaded_points[:,3] <= self.file_time_end
                         )
                         pts = self.loaded_points[mask, :3].astype(np.float32)
-                        stamps = np.full((pts.shape[0],1), time.time(), dtype=np.float32)
+                        stamps = np.full((pts.shape[0],1), time.monotonic(), dtype=np.float32)
                         data4 = np.hstack((pts, stamps))
                         coord_system = self.loaded_poses.copy()
 
                     # 拆出 XYZ + timestamp bytes
                     points_bin = data4.astype(np.float32).tobytes()
-                    print(len(data4))
                     coord_bin = json.dumps(coord_system, cls=NumpyEncoder).encode('utf-8')
 
                     # Header：coord 長度 + points 長度
@@ -599,6 +614,7 @@ class PointCloudViewer:
 
 
         # 更新 cache
+
         self.live_pts_cache = (pts3, pts_time)
         self.last_live_fetch_time = now
         return self.live_pts_cache

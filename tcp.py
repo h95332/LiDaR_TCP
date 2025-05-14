@@ -25,15 +25,15 @@
 # a = np.random.randn(1000, 1000)
 # b = np.dot(a, a.T)  # 
 
-import cv2
-print(cv2.getBuildInformation())
-
 # import cv2
-# print(cv2.__file__)       # 看它是從哪裡載入的
-# print(cv2.__version__)  
+# print(cv2.getBuildInformation())
 
-# import sysconfig, sys
-# print("PYTHON3_EXECUTABLE:", sys.executable)
-# print("PYTHON3_INCLUDE_DIR:", sysconfig.get_path("include"))
-# print("PYTHON3_LIBRARY:    (你需要找到 python311.lib 的實際路徑)")
-# print("PYTHON3_PACKAGES_PATH:", sysconfig.get_path("purelib"))
+# # import cv2
+# # print(cv2.__file__)       # 看它是從哪裡載入的
+# # print(cv2.__version__)  
+
+import sysconfig, sys
+print("PYTHON3_EXECUTABLE:", sys.executable)
+print("PYTHON3_INCLUDE_DIR:", sysconfig.get_path("include"))
+print("PYTHON3_LIBRARY:    (你需要找到 python311.lib 的實際路徑)")
+print("PYTHON3_PACKAGES_PATH:", sysconfig.get_path("purelib"))
