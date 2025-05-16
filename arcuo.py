@@ -15,7 +15,7 @@ from imgui.integrations.glfw import GlfwRenderer
 from scipy.spatial import cKDTree  # 此處未直接使用，但可供擴充
 import tkinter as tk
 from tkinter import filedialog, messagebox
-
+import torch
 # =============================================================================
 # ★★  Multi‑ArUco 量測表  ★★
 #   build_transform(tx,ty,tz, yaw,pitch,roll)  角度單位 deg, 先旋轉後平移
@@ -154,7 +154,7 @@ def detect_aruco_thread(camera_id=0, dictionary=aruco.DICT_4X4_250):
 # =============================================================================
 # 點雲轉換函數：利用 4x4 齊次變換矩陣轉換 (N, 3) 點雲資料
 # =============================================================================
-def transform_point_cloud(points, Lidar_T_Aruco):
+def transform_point_cloud_(points, Lidar_T_Aruco):
     """
     參數:
       points (np.ndarray): (N, 3) 點雲資料
@@ -170,6 +170,24 @@ def transform_point_cloud(points, Lidar_T_Aruco):
     transformed = (arTlidar @ points_hom.T).T
     
     return transformed[:, :3]
+
+def transform_point_cloud(points, Lidar_T_Aruco, device='cuda'):
+    """
+    參數:
+      points (np.ndarray): (N, 3) 點雲資料
+      transform_matrix (np.ndarray): 4x4 齊次變換矩陣
+    回傳:
+      轉換後的 (N, 3) 點雲資料
+    """
+    if points.size == 0:
+        return points
+    pts = torch.tensor(points, dtype=torch.float32, device=device)
+    ones = torch.ones((pts.shape[0], 1), dtype=torch.float32, device=device)
+    pts_hom = torch.cat([pts, ones], dim=1)  # (N,4)
+    mat = torch.tensor(np.linalg.inv(Lidar_T_Aruco), dtype=torch.float32, device=device)
+    transformed = pts_hom @ mat.T  # (N,4) @ (4,4)
+    return transformed[:, :3].cpu().numpy()  # 回 numpy 給 OpenGL/其他後續處理
+
 
 # =============================================================================
 # 相機到光達外參：定義一個 4x4 齊次矩陣（示例數值，可根據實際校正修改）
@@ -474,6 +492,10 @@ class PointCloudViewer:
         self.use_outer_fence = False  # 新增的 Outer Fence
         self.fence_outer_min = np.array([-3.0, -3.0, -1.0], dtype=np.float32)
         self.fence_outer_max = np.array([ 3.0,  3.0,  3.0], dtype=np.float32)
+        
+        self.enable_voxel = False        # 是否啟用下採樣
+        self.voxel_size = 0.03           # 預設體素格邊長
+
 
 
     def start_tcp_thread(self):
