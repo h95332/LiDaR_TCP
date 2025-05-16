@@ -237,28 +237,51 @@ class PointRingBuffer:
         self.index = (self.index + n) % self.max_points
         self.size = min(self.size + n, self.max_points)
 
+    # def get_recent_points(self, retention_time, with_time=False):
+    #     if self.size == 0:
+    #         if with_time:
+    #             return np.empty((0, 4), dtype=np.float32)
+    #         else:
+    #             return np.empty((0, 3), dtype=np.float32)
+
+    #     now = time.monotonic()
+    #     cutoff = now - retention_time
+
+    #     if self.size < self.max_points:
+    #         data = self.buffer[:self.size]
+    #     else:
+    #         data = np.vstack((self.buffer[self.index:], self.buffer[:self.index]))
+
+    #     idx = np.searchsorted(data[:, 3], cutoff, side='left')
+    #     valid = data[idx:]
+
+    #     if with_time:
+    #         return valid  # (N, 4)
+    #     else:
+    #         return valid[:, :3]  # (N, 3)
+        
     def get_recent_points(self, retention_time, with_time=False):
         if self.size == 0:
-            if with_time:
-                return np.empty((0, 4), dtype=np.float32)
-            else:
-                return np.empty((0, 3), dtype=np.float32)
-
+            return np.empty((0, 4 if with_time else 3), dtype=np.float32)
         now = time.monotonic()
         cutoff = now - retention_time
 
         if self.size < self.max_points:
             data = self.buffer[:self.size]
+            idx = np.searchsorted(data[:, 3], cutoff, side='left')
+            valid = data[idx:]
+            return valid if with_time else valid[:, :3]
         else:
-            data = np.vstack((self.buffer[self.index:], self.buffer[:self.index]))
-
-        idx = np.searchsorted(data[:, 3], cutoff, side='left')
-        valid = data[idx:]
-
-        if with_time:
-            return valid  # (N, 4)
-        else:
-            return valid[:, :3]  # (N, 3)
+            buf1 = self.buffer[self.index:]
+            buf2 = self.buffer[:self.index]
+            idx1 = np.searchsorted(buf1[:, 3], cutoff, side='left')
+            valid1 = buf1[idx1:] if idx1 < len(buf1) else np.empty((0, 4), dtype=np.float32)
+            valid2 = buf2[buf2[:, 3] >= cutoff] if buf2.size > 0 else np.empty((0, 4), dtype=np.float32)
+            if with_time:
+                return np.concatenate((valid1, valid2), axis=0)
+            else:
+                return np.concatenate((valid1[:, :3], valid2[:, :3]), axis=0)
+   
 
 
     def clear(self):
@@ -655,9 +678,11 @@ class PointCloudViewer:
         self.width = width
         self.height = height
         glViewport(0, 0, width, height)
+        safe_height = height if height > 0 else 1  # 防止除以零
         self.projection = pyrr.matrix44.create_perspective_projection_matrix(
-            45, width / height, 0.1, 100.0
+            45, width / safe_height, 0.1, 100.0
         )
+
 
 
     def init_buffers(self):
@@ -910,61 +935,37 @@ class PointCloudViewer:
                     # mat 已經是世界座標下的 marker 變換
                     self.draw_axes_from_matrix(mat, scale=0.5)
             glLineWidth(1.0)
-        # -------------------------
-        # ImGui 控制面板
-        # -------------------------
+
         imgui.new_frame()
-        imgui.begin("Control Panel")
+        imgui.begin("Control Panel", True)
+        imgui.set_window_size(720, 0, condition=imgui.ONCE)
 
-        # —— 第一部分：视图 & 参数 —— #
-        imgui.begin_group()
-        imgui.text(" Settings")
-        imgui.separator()
-        imgui.push_item_width(150)
-        _, self.retention_seconds = imgui.slider_float(
-            "Storage seconds", self.retention_seconds, 1.0, 30.0)
-        _, self.max_distance = imgui.slider_float(
-            "Max distance", self.max_distance, 1.0, 20.0)
-        changed, self.use_live_data = imgui.checkbox(
-            "Live Mode", self.use_live_data)
-        _, self.use_inner_fence = imgui.checkbox("Enable Inner Fence", self.use_inner_fence)
-        _, self.use_outer_fence = imgui.checkbox("Enable Outer Fence", self.use_outer_fence)
-        imgui.text("Outer Fence Min:")
-        _, self.fence_outer_min = imgui.input_float3("##outerminfence", *self.fence_outer_min)
-        imgui.text("Outer Fence Max:")
-        _, self.fence_outer_max = imgui.input_float3("##outermaxfence", *self.fence_outer_max)
-        imgui.text("Fence Min:")
-        _, self.fence_min = imgui.input_float3("##minfence", *self.fence_min)
-        imgui.text("Fence Max:")
-        _, self.fence_max = imgui.input_float3("##maxfence", *self.fence_max)
-        imgui.end_group()
+        # --------- 兩欄主面板 (不在欄內插入分隔線) ---------
+        imgui.columns(2, "main_columns")
 
-        imgui.same_line()
-
-        # —— 第二部分：文件操作 & 网络 —— #
+        # ================= 左欄 ==================
         imgui.begin_group()
         imgui.text("I/O & Network")
-        imgui.separator()
-        # —— 自訂 TCP/IP 設定 —— #
+        imgui.push_item_width(125)
         _, self.tcp_host = imgui.input_text("TCP IP", self.tcp_host, 64)
         _, self.tcp_port = imgui.input_int("TCP Port", self.tcp_port)
+        imgui.pop_item_width()
+
+        imgui.spacing()
+        imgui.text("Save Source:")
+        if imgui.radio_button("Live", self.save_source == 0): self.save_source = 0
+        imgui.same_line()
+        if imgui.radio_button("Global", self.save_source == 1): self.save_source = 1
+
+        imgui.spacing()
+        imgui.text("Actions")
+        imgui.push_item_width(170)
         if imgui.button("Open Saved PLY"):
             tk.Tk().withdraw()
-            path = filedialog.askopenfilename(
-                filetypes=[("PLY files", "*.ply")])
+            path = filedialog.askopenfilename(filetypes=[("PLY files", "*.ply")])
             if path:
                 self.load_ply_with_pose(path)
                 self.use_live_data = False
-        # 在 render() 裡 ImGui 控制面板的 I/O & Network 區塊
-        imgui.separator()
-        imgui.text(" Save source:")
-        if imgui.radio_button("Live",   self.save_source == 0):
-            self.save_source = 0
-        imgui.same_line()
-        if imgui.radio_button("Global", self.save_source == 1):
-            self.save_source = 1
-
-        imgui.separator()
         if imgui.button("Save to .PLY"):
             if self.save_source == 0:
                 self.save_live_to_ply()
@@ -972,85 +973,105 @@ class PointCloudViewer:
                 self.save_global_to_ply()
         if imgui.button("Clear Point Cloud"):
             with self.points_lock:
-                self.ring_buffer.clear()  
-        imgui.separator()
+                self.ring_buffer.clear()
         if imgui.button("Restart TCP Conn"):
-             self.restart_tcp_connection()
+            self.restart_tcp_connection()
         if imgui.button("Update ArUco"):
             with latest_transform_lock, global_transform_lock:
                 global_transform[:] = latest_transform_matrix.copy()
         if imgui.button("Exit App"):
             glfw.set_window_should_close(self.window, True)
-        imgui.end_group()
+        imgui.pop_item_width()
 
-        imgui.separator()
-
-        # —— 第四部分：Send Mode & 状态显示 —— #
-        imgui.begin_group()
+        imgui.spacing()
         imgui.text("Send Mode:")
-        imgui.separator()
-        # radio_button 回傳 True/False，不要用 unpack
-        if imgui.radio_button("Live##send",   self.send_mode == 0):
-            self.send_mode = 0
+        if imgui.radio_button("Live##send", self.send_mode == 0): self.send_mode = 0
         imgui.same_line()
-        if imgui.radio_button("Global##send", self.send_mode == 1):
-            self.send_mode = 1
+        if imgui.radio_button("Global##send", self.send_mode == 1): self.send_mode = 1
         imgui.same_line()
-        if imgui.radio_button("File##send",   self.send_mode == 2):
-            self.send_mode = 2
+        if imgui.radio_button("File##send", self.send_mode == 2): self.send_mode = 2
 
-        imgui.separator()
-        imgui.text(f"Current pts: {pts_array.shape[0]}")
-        imgui.text(f"Total stored: {total_pts}")
         imgui.end_group()
 
+        imgui.next_column()
+
+        # ================= 右欄 ==================
         imgui.begin_group()
-        imgui.text(" Global Map")
-        imgui.separator()
-        
-        # ── 新增功能 ──
-        changed, new_val = imgui.checkbox("Show Global##toggle",self.show_global)
-        if changed:
-            self.show_global = new_val    # 反轉即可
-        
-        if imgui.button("Open Saved PLY##global"):
-            tk.Tk().withdraw()
-            path = filedialog.askopenfilename(
-                filetypes=[("PLY files", "*.ply")],
-                title="選擇要加入全域地圖的 PLY 檔案"
-            )
-            if path:
-                # 讀檔→清空舊 global→匯入新點雲與三個 pose
-                self.load_ply_with_pose(path)
+
+        imgui.text("Settings")
+        imgui.push_item_width(120)
+        _, self.retention_seconds = imgui.slider_float("Storage", self.retention_seconds, 1.0, 30.0)
+        _, self.max_distance = imgui.slider_float("Max dist.", self.max_distance, 1.0, 20.0)
+        imgui.pop_item_width()
+        imgui.spacing()
+
+        imgui.text("Main Mode")
+        changed, self.use_live_data = imgui.checkbox("Live Mode", self.use_live_data)
+        _, self.use_inner_fence = imgui.checkbox("Enable Inner Fence", self.use_inner_fence)
+        _, self.use_outer_fence = imgui.checkbox("Enable Outer Fence", self.use_outer_fence)
+        imgui.spacing()
+
+        imgui.text("Fence Setting")
+        imgui.push_item_width(180)
+        imgui.text("Outer Min:")
+        _, self.fence_outer_min = imgui.input_float3("##outermin", *self.fence_outer_min)
+        imgui.text("Outer Max:")
+        _, self.fence_outer_max = imgui.input_float3("##outermax", *self.fence_outer_max)
+        imgui.text("Min:")
+        _, self.fence_min = imgui.input_float3("##min", *self.fence_min)
+        imgui.text("Max:")
+        _, self.fence_max = imgui.input_float3("##max", *self.fence_max)
+        imgui.pop_item_width()
+
+        imgui.end_group()
+
+        # --------- 回到單欄，下方放 Global Map ---------
+        imgui.columns(1)
+        imgui.spacing()
+
+        # ========== Global Map 可收合區塊 ==========
+        if imgui.collapsing_header("Global Map", visible=True, flags=imgui.TREE_NODE_DEFAULT_OPEN)[0]:
+            imgui.spacing()
+            changed, new_val = imgui.checkbox("Show Global##toggle", self.show_global)
+            if changed:
+                self.show_global = new_val
+            if imgui.button("Open Saved PLY##global"):
+                tk.Tk().withdraw()
+                path = filedialog.askopenfilename(
+                    filetypes=[("PLY files", "*.ply")],
+                    title="選擇要加入全域地圖的 PLY 檔案"
+                )
+                if path:
+                    self.load_ply_with_pose(path)
+                    with global_lock:
+                        global_size = 0
+                    global_coords.clear()
+                    add_to_global(self.loaded_points[:, :3].copy())
+                    for n, m in self.loaded_poses.items():
+                        add_global_coord(n, m)
+            if imgui.button("Add to Global Map"):
+                add_to_global(pts_array.copy())
+                add_global_coord("world",  self.Word_Point)
+                add_global_coord("camera", self.Camera_Position)
+                add_global_coord("lidar",  self.Lidar_Position)
+                for mid, w2m in GLOBAL_TO_MARKER.items():
+                    if mid == 0:
+                        continue
+                    add_global_coord(f"marker_{mid}", w2m)
+            if imgui.button("Clear Global Points"):
                 with global_lock:
                     global_size = 0
-                global_coords.clear()
-                add_to_global(self.loaded_points[:, :3].copy())
-                for n, m in self.loaded_poses.items():
-                    add_global_coord(n, m)
+                    global_pts[:] = 0
+                    global_coords.clear()
+            if imgui.button("Reset View"):
+                self.rotation_x = self.rotation_y = 0.0
+                self.pan_offset = np.array([0.0, 0.0, 0.0], np.float32)
+                self.zoom = 20.0
 
-        if imgui.button("Add to Global Map"):
-            add_to_global(pts_array.copy())
-            add_global_coord("world",  self.Word_Point)
-            add_global_coord("camera", self.Camera_Position)
-            add_global_coord("lidar",  self.Lidar_Position)
-            for mid, w2m in GLOBAL_TO_MARKER.items():
-                if mid == 0: continue
-                add_global_coord(f"marker_{mid}", w2m)
-        
-        if imgui.button("Clear Global Points"):
-            with global_lock:
-                global_size = 0
-                global_pts[:] = 0
-                global_coords.clear()
-        
-        if imgui.button("Reset View"):
-            self.rotation_x = self.rotation_y = 0.0
-            self.pan_offset = np.array([0.0,0.0,0.0], np.float32)
-            self.zoom = 20.0
-        
-        imgui.text(f"Accumulated points: {global_size}")
-        imgui.end_group()
+            imgui.text(f"Accumulated points: {global_size:,}")
+
+        imgui.separator()
+        imgui.text(f"FPS: {imgui.get_io().framerate:.1f}  |  pts: {pts_array.shape[0]:,}  |  Total: {total_pts:,}")
 
         imgui.end()
         imgui.render()
