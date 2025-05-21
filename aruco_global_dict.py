@@ -509,6 +509,9 @@ class PointCloudViewer:
         
         self.enable_voxel = False        # 是否啟用下採樣
         self.voxel_size = 0.03           # 預設體素格邊長
+        self.global_scans = []         # list of dict{name:str, points:np.ndarray, coords:dict}
+        self.global_scans_show = []    # list of bool，同 self.global_scans 長度
+                
 
 
 
@@ -876,13 +879,14 @@ class PointCloudViewer:
         glUniform1i(glGetUniformLocation(self.shader_program, "useUniformColor"), 0)
         if self.show_global:
         # ►► 只顯示 Global Map ◄◄
-            with global_map_lock:
-                pts_list = [entry["points"] for id, entry in global_map.items() if global_map_show.get(id, True)]
+            pts_list = []
+            for scan, show in zip(self.global_scans, self.global_scans_show):                
+                if show and scan["points"].size:
+                    pts_list.append(scan["points"])
             if pts_list:
-                pts_array = np.vstack(pts_list)
+                pts_array = np.vstack(pts_list).astype(np.float32)
             else:
-                pts_array = np.empty((0, 3), dtype=np.float32)
-
+                pts_array = np.empty((0,3), dtype=np.float32)
             total_pts = global_size
         elif self.use_live_data:
             # ► 即時模式：讀取環狀緩衝並套用最新 ArUco 變換
@@ -1071,66 +1075,92 @@ class PointCloudViewer:
         imgui.spacing()
 
         # ========== Global Map 可收合區塊 ==========
-
         if imgui.collapsing_header("Global Map", visible=True, flags=imgui.TREE_NODE_DEFAULT_OPEN)[0]:
             imgui.spacing()
-            imgui.text("ArUco ID Points Management:")
-            remove_ids = []
-            with global_map_lock:
-                for aruco_id in sorted(global_map.keys()):
-                    show = global_map_show.get(aruco_id, True)
-                    changed, show = imgui.checkbox(f"aruco_id {aruco_id}", show)
-                    if changed:
-                        global_map_show[aruco_id] = show
-                    imgui.same_line()
-                    if imgui.button(f"Remove##{aruco_id}"):
-                        remove_ids.append(aruco_id)
-                for rid in remove_ids:
-                    remove_from_global_map(rid)
-
-            # ===== 這裡的 combo 應該一直顯示，而不是在 button click 時才顯示 =====
-            aruco_id_list = sorted(list(global_map.keys()))
-            if not hasattr(self, "selected_aruco_id"):
-                self.selected_aruco_id = aruco_id_list[0] if aruco_id_list else 0
-
-            if aruco_id_list:
-                try:
-                    current_index = aruco_id_list.index(self.selected_aruco_id)
-                except ValueError:
-                    current_index = 0
-                    self.selected_aruco_id = aruco_id_list[0]
-                changed, idx = imgui.combo(
-                    "Select ArUco ID",
-                    current_index,
-                    [str(i) for i in aruco_id_list]
+            changed, new_val = imgui.checkbox("Show Global##toggle", self.show_global)
+            if changed:
+                self.show_global = new_val
+            if imgui.button("Open Saved PLY##global"):
+                tk.Tk().withdraw()
+                path = filedialog.askopenfilename(
+                    filetypes=[("PLY files", "*.ply")],
+                    title="選擇要加入全域地圖的 PLY 檔案"
                 )
-                if changed:
-                    self.selected_aruco_id = aruco_id_list[idx]
-            else:
-                imgui.text("No ArUco IDs available")
-
-            if imgui.button("Add Current Points (by ArUco ID)"):
-                current_id = self.selected_aruco_id
-                pts3, stamps = self.get_latest_live_points()
-                poses = {
-                    "world":  self.Word_Point,
-                    "camera": self.Camera_Position,
-                    "lidar":  self.Lidar_Position,
-                }
-                add_to_global_map(current_id, pts3, poses)
-
-            if imgui.button("Clear All"):
-                with global_map_lock:
-                    global_map.clear()
-                    global_map_show.clear()
-
+                if path:
+                    self.load_ply_with_pose(path)
+                    with global_lock:
+                        global_size = 0
+                    global_coords.clear()
+                    add_to_global(self.loaded_points[:, :3].copy())
+                    for n, m in self.loaded_poses.items():
+                        add_global_coord(n, m)
+            if imgui.button("Add to Global Map"):
+                scan_name = f"scan_{len(self.global_scans)+1}"
+                self.global_scans.append({
+                    "name":   scan_name,
+                    "points": pts_array.copy(),
+                    "coords": {
+                        "world":  self.Word_Point.copy(),
+                        "camera": self.Camera_Position.copy(),
+                        "lidar":  self.Lidar_Position.copy()
+                    }
+                })
+                self.global_scans_show.append(True)  # 預設顯示
+            if imgui.button("Clear Global Points"):
+            # 清除新機制
+                self.global_scans.clear()
+                self.global_scans_show.clear()
+                with global_lock:
+                    global_size = 0
+                    global_pts[:] = 0
+                    global_coords.clear()
             if imgui.button("Reset View"):
                 self.rotation_x = self.rotation_y = 0.0
                 self.pan_offset = np.array([0.0, 0.0, 0.0], np.float32)
                 self.zoom = 20.0
+            imgui.separator()
+            # ---- 下拉式多選掃描列表 ----
+            imgui.text("Scans:")
+            # 組合預覽文字：已勾選的掃描名稱，用逗號分隔
+            preview = ", ".join(
+                scan["name"] for i,scan in enumerate(self.global_scans)
+                if self.global_scans_show[i]
+            ) or "Select Scans"
+            if imgui.begin_combo("##scan_combo", preview):
+                for idx, scan in enumerate(self.global_scans):
+                    sel = self.global_scans_show[idx]
+                    clicked, new_sel = imgui.selectable(scan["name"], sel)
+                    if clicked:
+                        self.global_scans_show[idx] = not sel
+                    if new_sel:
+                        imgui.set_item_default_focus()
+                imgui.end_combo()
+
+            # ---- 刪除單一掃描 ----
+            imgui.text("Delete Scan:")
+            # 預設第一筆或上次選擇
+            if not hasattr(self, "delete_idx"):
+                self.delete_idx = 0
+            current = (
+                self.global_scans[self.delete_idx]["name"]
+                if self.global_scans else ""
+            )
+            if imgui.begin_combo("##del_combo", current):
+                for idx, scan in enumerate(self.global_scans):
+                    sel = (idx == self.delete_idx)
+                    if imgui.selectable(scan["name"], sel)[0]:
+                        self.delete_idx = idx
+                imgui.end_combo()
+            imgui.same_line()
+            if imgui.button("Delete"):
+                if 0 <= self.delete_idx < len(self.global_scans):
+                    del self.global_scans[self.delete_idx]
+                    del self.global_scans_show[self.delete_idx]
+                    # 調整 delete_idx 不越界
+                    self.delete_idx = min(self.delete_idx, len(self.global_scans)-1)
+            imgui.separator()
 
             imgui.text(f"Accumulated points: {global_size:,}")
-
 
         imgui.separator()
         imgui.text(f"FPS: {imgui.get_io().framerate:.1f}  |  pts: {pts_array.shape[0]:,}  |  Total: {total_pts:,}")
@@ -1213,12 +1243,8 @@ class PointCloudViewer:
 
     def save_global_to_ply(self):
         # 1) 取出 global_pts
-        with global_map_lock:
-            pts_list = [entry["points"] for id, entry in global_map.items() if global_map_show.get(id, True)]
-        if pts_list:
-            pts = np.vstack(pts_list)
-        else:
-            pts = np.empty((0, 3), dtype=np.float32)
+        with global_lock:
+            pts = global_pts[:global_size].copy()
         if pts.size == 0:
             print("Global Map 是空的，無點可存")
             return
