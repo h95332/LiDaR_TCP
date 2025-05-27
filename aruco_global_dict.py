@@ -445,7 +445,7 @@ class PointCloudViewer:
         self.zoom = 20.0
         self.retention_seconds = 5.0
         self.pan_offset = np.array([0.0, 0.0, 0.0], dtype=np.float32)
-        self.ring_buffer = PointRingBuffer(max_points=10000000)
+        self.ring_buffer = PointRingBuffer(max_points=1000000)
         self.points_lock = threading.Lock()
         # 0 = Live, 1 = Global, 2 = File
         self.send_mode = 0
@@ -607,12 +607,19 @@ class PointCloudViewer:
                     elif self.send_mode == 1:
                             selected_pts = []
                             coord_system = {}
+                            # ✅ 加入 GLOBAL_TO_MARKER 中所有 marker 資訊
+                            for marker_id, mat in GLOBAL_TO_MARKER.items():
+                                coord_system[f"marker_{marker_id}"] = mat
                             for scan, show in zip(self.global_scans, self.global_scans_show):
                                 if show and "points" in scan:
                                     selected_pts.append(scan["points"])
                                     if "coords" in scan:
                                         for name, mat in scan["coords"].items():
+                                            # 👇 新增這段
+                                            if name in ["camera", "lidar", "world"]:
+                                                coord_system[name] = mat
                                             coord_system[f"{scan['name']}_{name}"] = mat
+
 
                             if not selected_pts:
                                 data4 = np.empty((0, 4), dtype=np.float32)
@@ -949,9 +956,9 @@ class PointCloudViewer:
             pts_array = pts3d
             total_pts = self.loaded_points.shape[0]
             # 直接用 PLY 裡的三組 4×4 矩陣
-            self.Word_Point      = self.loaded_poses.get("world",  np.eye(4, dtype=np.float32))
-            self.Camera_Position = self.loaded_poses.get("camera", np.eye(4, dtype=np.float32))
-            self.Lidar_Position  = self.loaded_poses.get("lidar",  np.eye(4, dtype=np.float32))
+            word_mat    = self.loaded_poses.get("world",  np.eye(4, dtype=np.float32))
+            cam_mat     = self.loaded_poses.get("camera", np.eye(4, dtype=np.float32))
+            lidar_mat   = self.loaded_poses.get("lidar",  np.eye(4, dtype=np.float32))
 
             self.Lidar_T_Aruco   = None  # 不再需要 transform_point_cloud
             # #復原用
@@ -984,22 +991,46 @@ class PointCloudViewer:
         # 根據目前模式切換對應的來源
         # -------------------------
         glLineWidth(3.0)
-        if self.use_live_data:
+        # -------------------------
+        # 建立坐標系（依模式選擇）
+        # -------------------------
+        if self.use_live_data and not self.show_global:
+            with global_transform_lock:
+                Camera_T_Aruco = global_transform.copy()
+            # ✅ 只有 Live 模式更新 self.*：可供 Add to Global Map 使用
+            self.Word_Point      = np.eye(4, dtype=np.float32)
+            self.Camera_Position = np.linalg.inv(Camera_T_Aruco)
+            self.Lidar_Position  = self.Camera_Position @ Cam_T_Lidar
+
+            # 繪製 Live 的坐標系
             self.draw_axes_from_matrix(self.Word_Point,      scale=1,   coord_type="world")
             self.draw_axes_from_matrix(self.Camera_Position, scale=1,   coord_type="camera")
             self.draw_axes_from_matrix(self.Lidar_Position,  scale=1.5, coord_type="lidar")
+
         elif self.show_global:
-            # 顯示每個 scan 的 coords（你已有這段在後面，但這裡也可以展示第一筆）
+            # ✅ 顯示 Global Map 的各筆 scan 的 coords
             for scan, show in zip(self.global_scans, self.global_scans_show):
                 if not show or "coords" not in scan:
                     continue
                 for coord_name, mat in scan["coords"].items():
                     self.draw_axes_from_matrix(mat, scale=0.5, coord_type=coord_name)
-                break  # 只畫一筆代表性 scan
+                break  # 只繪製一筆代表即可
+
         elif not self.use_live_data:
-            self.draw_axes_from_matrix(self.loaded_poses.get("world",  np.eye(4)), scale=1,   coord_type="world")
-            self.draw_axes_from_matrix(self.loaded_poses.get("camera", np.eye(4)), scale=1,   coord_type="camera")
-            self.draw_axes_from_matrix(self.loaded_poses.get("lidar",  np.eye(4)), scale=1.5, coord_type="lidar")
+            # ✅ File 模式：找出 *_world, *_camera, *_lidar 的欄位
+            word_key  = next((k for k in self.loaded_poses if k.endswith("_world")), None)
+            cam_key   = next((k for k in self.loaded_poses if k.endswith("_camera")), None)
+            lidar_key = next((k for k in self.loaded_poses if k.endswith("_lidar")), None)
+
+            word_mat  = self.loaded_poses.get(word_key,  np.eye(4, dtype=np.float32))
+            cam_mat   = self.loaded_poses.get(cam_key,   np.eye(4, dtype=np.float32))
+            lidar_mat = self.loaded_poses.get(lidar_key, np.eye(4, dtype=np.float32))
+
+            # 用正確的 coord_type 繪製有顏色的 XYZ 軸
+            self.draw_axes_from_matrix(word_mat,  scale=1,   coord_type="world")
+            self.draw_axes_from_matrix(cam_mat,   scale=1,   coord_type="camera")
+            self.draw_axes_from_matrix(lidar_mat, scale=1.5, coord_type="lidar")
+
         glLineWidth(1.0)
 
 
@@ -1128,100 +1159,106 @@ class PointCloudViewer:
 
         imgui.end_group()
 
-        # --------- 回到單欄，下方放 Global Map ---------
-        imgui.columns(1)
+ 
+        imgui.separator()
+        imgui.text("Global Map Tools")
         imgui.spacing()
 
-        # ========== Global Map 可收合區塊 ==========
-        if imgui.collapsing_header("Global Map", visible=True, flags=imgui.TREE_NODE_DEFAULT_OPEN)[0]:
-            imgui.spacing()
-            changed, new_val = imgui.checkbox("Show Global##toggle", self.show_global)
+        if imgui.button("Add to Global Map"):
+            scan_name = f"scan_{len(self.global_scans)+1}"
+            self.global_scans.append({
+                "name": scan_name,
+                "points": pts_array.copy(),
+                "coords": {
+                    "world":  self.Word_Point.copy(),
+                    "camera": self.Camera_Position.copy(),
+                    "lidar":  self.Lidar_Position.copy()
+                }
+            })
+            self.global_scans_show.append(True)
+            print(f"✅ 加入 Global Map：{scan_name}，點數={pts_array.shape[0]}")
+
+        imgui.same_line()
+        if imgui.button("Clear Global Points"):
+            self.global_scans.clear()
+            self.global_scans_show.clear()
+            with global_lock:
+                global_size = 0
+                global_pts[:] = 0
+                global_coords.clear()
+
+        imgui.spacing()
+        if imgui.collapsing_header("Global Map Viewer", visible=True, flags=imgui.TREE_NODE_DEFAULT_OPEN)[0]:
+            changed, new_val = imgui.checkbox("Show Global", self.show_global)
             if changed:
                 self.show_global = new_val
-        if imgui.button("Open Saved PLY##global"):
-            tk.Tk().withdraw()
-            path = filedialog.askopenfilename(
-                filetypes=[("PLY files", "*.ply")],
-                title="選擇要加入全域地圖的 PLY 檔案"
-            )
-            if path:
-                self.load_ply_with_pose(path)
-                scan_name = f"scan_{len(self.global_scans)+1}"
-                self.global_scans.append({
-                    "name": scan_name,
-                    "points": self.loaded_points[:, :3].copy(),
-                    "coords": self.loaded_poses.copy()
-                })
-                self.global_scans_show.append(True)
-                print(f"✅ 加入 Global Map：{scan_name}，點數={self.loaded_points.shape[0]}")
-            if imgui.button("Add to Global Map"):
-                scan_name = f"scan_{len(self.global_scans)+1}"
-                self.global_scans.append({
-                    "name":   scan_name,
-                    "points": pts_array.copy(),
-                    "coords": {
-                        "world":  self.Word_Point.copy(),
-                        "camera": self.Camera_Position.copy(),
-                        "lidar":  self.Lidar_Position.copy()
-                    }
-                })
-                self.global_scans_show.append(True)  # 預設顯示
-            if imgui.button("Clear Global Points"):
-            # 清除新機制
-                self.global_scans.clear()
-                self.global_scans_show.clear()
-                with global_lock:
-                    global_size = 0
-                    global_pts[:] = 0
-                    global_coords.clear()
-            if imgui.button("Reset View"):
-                self.rotation_x = self.rotation_y = 0.0
-                self.pan_offset = np.array([0.0, 0.0, 0.0], np.float32)
-                self.zoom = 20.0
-            imgui.separator()
-        # ---- 下拉式多選掃描列表 ----
-        imgui.text("Scans:")
-        # 組合預覽文字：已勾選的掃描名稱，用逗號分隔
-        preview = ", ".join(
-            scan["name"] for i,scan in enumerate(self.global_scans)
-            if self.global_scans_show[i]
-        ) or "Select Scans"
-        if imgui.begin_combo("##scan_combo", preview):
-            for idx, scan in enumerate(self.global_scans):
-                sel = self.global_scans_show[idx]
-                clicked, new_sel = imgui.selectable(scan["name"], sel)
-                if clicked:
-                    self.global_scans_show[idx] = not sel
-                if new_sel:
-                    imgui.set_item_default_focus()
-            imgui.end_combo()
 
-        # ---- 刪除單一掃描 ----
-        imgui.text("Delete Scan:")
-        # 預設第一筆或上次選擇
-        if not hasattr(self, "delete_idx"):
-            self.delete_idx = 0
-        current = (
-            self.global_scans[self.delete_idx]["name"]
-            if self.global_scans else ""
-        )
-        if imgui.begin_combo("##del_combo", current):
-            for idx, scan in enumerate(self.global_scans):
-                sel = (idx == self.delete_idx)
-                if imgui.selectable(scan["name"], sel)[0]:
-                    self.delete_idx = idx
-            imgui.end_combo()
-        imgui.same_line()
-        if imgui.button("Delete"):
+            if imgui.button("Open Saved PLY##global"):
+                tk.Tk().withdraw()
+                path = filedialog.askopenfilename(
+                    filetypes=[("PLY files", "*.ply")],
+                    title="選擇要加入全域地圖的 PLY 檔案"
+                )
+                if path:
+                    self.load_ply_with_pose(path)
+                    scan_name = f"scan_{len(self.global_scans)+1}"
+                    self.global_scans.append({
+                        "name": scan_name,
+                        "points": self.loaded_points[:, :3].copy(),
+                        "coords": self.loaded_poses.copy()
+                    })
+                    self.global_scans_show.append(True)
+                    print(f"加入 Global Map：{scan_name}，點數={self.loaded_points.shape[0]}")
+
+            # 合併列：掃描選擇 + 刪除選單
+            imgui.spacing()
+            imgui.columns(2, "scan_columns", border=False)
+
+            # 左欄：掃描顯示選擇
+            imgui.text("Scans")
+            preview = ", ".join(
+                scan["name"] for i, scan in enumerate(self.global_scans)
+                if self.global_scans_show[i]
+            ) or "Select Scans"
+            if imgui.begin_combo("##scan_combo", preview):
+                for idx, scan in enumerate(self.global_scans):
+                    sel = self.global_scans_show[idx]
+                    clicked, new_sel = imgui.selectable(scan["name"], sel)
+                    if clicked:
+                        self.global_scans_show[idx] = not sel
+                imgui.end_combo()
+
+            imgui.next_column()
+
+            # 右欄：刪除單一掃描
+            imgui.text("Delete Scan")
+            if not hasattr(self, "delete_idx"):
+                self.delete_idx = 0
+            current = ""
             if 0 <= self.delete_idx < len(self.global_scans):
-                del self.global_scans[self.delete_idx]
-                del self.global_scans_show[self.delete_idx]
-                # 調整 delete_idx 不越界
-                self.delete_idx = min(self.delete_idx, len(self.global_scans)-1)
+                current = self.global_scans[self.delete_idx]["name"]
+            if imgui.begin_combo("##del_combo", current):
+                for idx, scan in enumerate(self.global_scans):
+                    sel = (idx == self.delete_idx)
+                    if imgui.selectable(scan["name"], sel)[0]:
+                        self.delete_idx = idx
+                imgui.end_combo()
+            imgui.same_line()
+            if imgui.button("Delete", width=60):
+                if 0 <= self.delete_idx < len(self.global_scans):
+                    del self.global_scans[self.delete_idx]
+                    del self.global_scans_show[self.delete_idx]
+                # 安全修正：重新設定 delete_idx，避免越界
+                if len(self.global_scans) == 0:
+                    self.delete_idx = 0
+                else:
+                    self.delete_idx = min(self.delete_idx, len(self.global_scans) - 1)
 
-        imgui.separator()
 
-        imgui.text(f"Accumulated points: {global_size:,}")
+            imgui.columns(1)
+            imgui.separator()
+            imgui.text(f"Accumulated points: {global_size:,}")
+
 
         imgui.separator()
         imgui.text(f"FPS: {imgui.get_io().framerate:.1f}  |  pts: {pts_array.shape[0]:,}  |  Total: {total_pts:,}")
@@ -1363,15 +1400,17 @@ class PointCloudViewer:
 # 額外：繪製 ArUco、Camera、LiDAR 的動態坐標系（XYZ）
 # -------------------------
     def draw_axes_from_matrix(self, matrix, scale=0.2, coord_type=None):
-        # 定義各種坐標系對應的顏色（XYZ 軸）
+        # 從名稱中提取最後一段（如 scan_1_camera ➜ camera）
+        if coord_type is not None and "_" in coord_type:
+            coord_type = coord_type.split("_")[-1]  # 抽出 camera/lidar/world
+
         color_map = {
             "world":  [(1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)],  # 紅綠藍
             "camera": [(1.0, 0.5, 0.0), (0.5, 1.0, 0.0), (1.0, 1.0, 0.0)],  # 橘黃亮黃
             "lidar":  [(0.0, 1.0, 1.0), (1.0, 0.0, 1.0), (0.5, 0.5, 1.0)],  # 青紫藍
-            None:     [(1.0, 1.0, 1.0), (1.0, 1.0, 1.0), (1.0, 1.0, 1.0)]   # 白色 fallback
+            None:     [(1.0, 1.0, 1.0)] * 3                                # fallback 白色
         }
         colors = color_map.get(coord_type, color_map[None])
-
         # 產生 VAO 快取 key（matrix + scale）
         key = tuple(matrix.flatten()) + (scale,)
         vao, vertex_count = self._axis_vao_cache.get(key, (None, 0))

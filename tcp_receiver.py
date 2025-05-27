@@ -201,12 +201,14 @@ class TCPReceiver(threading.Thread):
                         self.ring_buffer.add_points(pts4)
 
                     if self.viewer:
-                        mats = {}
-                        for k, v in coord_sys.items():
-                            arr = np.array(v, dtype=np.float32)
-                            if arr.shape == (4, 4):
-                                mats[k] = arr
-                        self.viewer.remote_coordinate_system = mats
+                        if self.viewer.remote_coordinate_system is None:
+                            self.viewer.remote_coordinate_system = {}
+                        with self.viewer.coord_lock:  # 👈 加這行
+                            for k, v in coord_sys.items():
+                                arr = np.array(v, dtype=np.float32)
+                                if arr.shape == (4, 4):
+                                    self.viewer.remote_coordinate_system[k] = arr
+
                     glfw.post_empty_event()
             except Exception as e:
                 print(f"TCP 接收錯誤：{e}")
@@ -258,6 +260,7 @@ class PointCloudViewer:
         self.tcp_receiver = TCPReceiver('0.0.0.0', 9000, self.ring_buffer, self.points_lock)
         self.tcp_receiver.viewer = self
         self.tcp_receiver.start()
+        self.coord_lock = threading.Lock()
 
         self.init_glfw()
         self.init_imgui()
@@ -483,14 +486,18 @@ class PointCloudViewer:
             glDrawArrays(GL_POINTS, 0, min(num_points, self.max_points))
             glBindVertexArray(0)
 
-        # 如果有接收到遠端座標系統，繪製 XYZ 軸
         if self.remote_coordinate_system:
-            if "lidar" in self.remote_coordinate_system:
-                self.draw_axes_from_matrix(self.remote_coordinate_system["lidar"], scale=1.5, colors=[(0, 1, 1), (1, 0, 1), (0.5, 0.5, 1)])  # 青紫藍
-            if "camera" in self.remote_coordinate_system:
-                self.draw_axes_from_matrix(self.remote_coordinate_system["camera"], scale=1.0, colors=[(1, 0.5, 0), (0.5, 1, 0), (1, 1, 0)])  # 橘綠黃
-            if "world" in self.remote_coordinate_system:
-                self.draw_axes_from_matrix(self.remote_coordinate_system["world"], scale=1.0, colors=[(1, 0, 0), (0, 1, 0), (0, 0, 1)])  # 紅綠藍
+            with self.coord_lock:
+                for name, matrix in self.remote_coordinate_system.items():
+                    if name == "lidar":
+                        self.draw_axes_from_matrix(matrix, scale=1.5, colors=[(0, 1, 1), (1, 0, 1), (0.5, 0.5, 1)])  # 青紫藍
+                    elif name == "camera":
+                        self.draw_axes_from_matrix(matrix, scale=1.0, colors=[(1, 0.5, 0), (0.5, 1, 0), (1, 1, 0)])  # 橘綠黃
+                    elif name == "world":
+                        self.draw_axes_from_matrix(matrix, scale=1.0, colors=[(1, 0, 0), (0, 1, 0), (0, 0, 1)])  # 紅綠藍
+                    elif name.startswith("marker_"):
+                        self.draw_axes_from_matrix(matrix, scale=0.6, colors=[(0.6, 0.6, 0.6), (0.3, 0.3, 0.3), (0.2, 0.2, 0.2)])  # 淺灰系
+
 
 
         # 繪製格線
