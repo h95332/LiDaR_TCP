@@ -32,19 +32,19 @@ def build_transform(tx, ty, tz, yaw_deg=0.0, pitch_deg=0.0, roll_deg=0.0):
     return T @ Rz @ Ry @ Rx
 
 GLOBAL_TO_MARKER = {
-    0: np.eye(4, dtype=np.float32),              # id 0 為世界原點
-    1: build_transform(0.00, 1.00, 0.00),     # 以下請依手動量測填值
-    2: build_transform(0.00, 1.00, 0.000),
-    3: build_transform(0.00, 2.00, 0.000),
-    4: build_transform(0.00, 3.00, 0.000),
-    5: build_transform(0.00, 4.00, 0.000),
-    6: build_transform(0.00, 5.00, 0.000),
-    7: build_transform(0.00, 6.00, 0.000),
-    8: build_transform(0.00, 8.00, 0.000),
-    9: build_transform(0.00, 10.00, 0.000),
-    10: build_transform(0.00, 12.00, 0.000),
-    # …持續新增
+    0: np.eye(4, dtype=np.float32),
+    1: build_transform(0.0, 1.0, 0.0),
+    2: build_transform(0.0, 2.0, 0.0),
+    3: build_transform(0.0, 3.0, 0.0),
+    4: build_transform(0.0, 4.0, 0.0),
+    5: build_transform(0.0, 5.0, 0.0),
+    6: build_transform(0.0, 6.0, 0.0),
+    7: build_transform(0.0, 7.0, 0.0),
+    8: build_transform(0.0, 9.0, 0.0),
+    9: build_transform(0.0, 11.0, 0.0),
+    10: build_transform(0.0, 13.0, 0.0),
 }
+
 
 # =============================================================================
 # ★★  全域點雲緩衝 (按鈕觸發才 append)  ★★
@@ -241,7 +241,9 @@ T = np.eye(4, dtype=np.float32)
 T[:3, 3] = [dx, dy, dz]
 
 # Camera to LiDAR 的外參（先旋轉再平移）
-Cam_T_Lidar = T @ R
+#Cam_T_Lidar = T @ R
+
+
 
 # =============================================================================
 # PointRingBuffer 類別：環狀點雲資料緩衝區
@@ -511,9 +513,9 @@ class PointCloudViewer:
         self.voxel_size = 0.03           # 預設體素格邊長
         self.global_scans = []         # list of dict{name:str, points:np.ndarray, coords:dict}
         self.global_scans_show = []    # list of bool，同 self.global_scans 長度
+
+        self.theta_x_deg = -25.0  # 預設角度（度數）
                 
-
-
 
     def start_tcp_thread(self):
         self._tcp_stop_event.clear()
@@ -522,6 +524,31 @@ class PointCloudViewer:
             daemon=True
         )
         self.tcp_sender_thread.start()
+
+    def compute_cam_to_lidar(self):
+        dx, dy, dz = 0.0, 0.075, -0.023
+        theta_z = np.radians(-67.5)
+        cos_z, sin_z = np.cos(theta_z), np.sin(theta_z)
+        Rz = np.array([
+            [cos_z, -sin_z, 0, 0],
+            [sin_z,  cos_z, 0, 0],
+            [0,      0,     1, 0],
+            [0,      0,     0, 1]
+        ], dtype=np.float32)
+
+        theta_x = np.radians(self.theta_x_deg)
+        cos_x, sin_x = np.cos(theta_x), np.sin(theta_x)
+        Rx = np.array([
+            [1,     0,      0, 0],
+            [0, cos_x, -sin_x, 0],
+            [0, sin_x,  cos_x, 0],
+            [0,     0,      0, 1]
+        ], dtype=np.float32)
+
+        R = Rx @ Rz
+        T = np.eye(4, dtype=np.float32)
+        T[:3, 3] = [dx, dy, dz]
+        return T @ R
 
 
     def restart_tcp_connection(self):
@@ -578,14 +605,21 @@ class PointCloudViewer:
                             "world":  self.Word_Point,
                         }
                     elif self.send_mode == 1:
-                        with global_lock:
-                            glob = global_pts[:global_size].copy()
-                        stamps = np.full((glob.shape[0],1), time.monotonic(), dtype=np.float32)
-                        data4 = np.hstack((glob, stamps))
-                        coord_system = {
-                            name: mat
-                            for name, mat in global_coords.items()
-                        }
+                            selected_pts = []
+                            coord_system = {}
+                            for scan, show in zip(self.global_scans, self.global_scans_show):
+                                if show and "points" in scan:
+                                    selected_pts.append(scan["points"])
+                                    if "coords" in scan:
+                                        for name, mat in scan["coords"].items():
+                                            coord_system[f"{scan['name']}_{name}"] = mat
+
+                            if not selected_pts:
+                                data4 = np.empty((0, 4), dtype=np.float32)
+                            else:
+                                pts = np.vstack(selected_pts)
+                                stamps = np.full((pts.shape[0], 1), time.monotonic(), dtype=np.float32)
+                                data4 = np.hstack((pts, stamps))
                     else:  # File 模式
                         mask = np.logical_and(
                             self.loaded_points[:,3] >= self.file_time_start,
@@ -638,6 +672,7 @@ class PointCloudViewer:
 
         # 🔥 先更新 Camera_Position 和 Lidar_Position
         self.Camera_Position = np.linalg.inv(Camera_T_Aruco)
+        Cam_T_Lidar = self.compute_cam_to_lidar()
         self.Lidar_Position  = self.Camera_Position @ Cam_T_Lidar
 
         # 然後建立 LiDAR 到 ArUco 世界座標的變換
@@ -847,6 +882,7 @@ class PointCloudViewer:
 
     def render(self):
         global global_size
+        Cam_T_Lidar = self.compute_cam_to_lidar()
         # 清除畫面
         glClearColor(0.2, 0.2, 0.2, 1.0)
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
@@ -942,14 +978,30 @@ class PointCloudViewer:
         glDrawArrays(GL_LINES, 0, self.grid_vertex_count)
         glBindVertexArray(0)
 
+
         # -------------------------
         # 繪製動態座標系 (World / Camera / LiDAR)
+        # 根據目前模式切換對應的來源
         # -------------------------
         glLineWidth(3.0)
-        self.draw_axes_from_matrix(self.Word_Point,      scale=1,   colors=[(1,0,0),(0,1,0),(0,0,1)])
-        self.draw_axes_from_matrix(self.Camera_Position, scale=1,   colors=[(1,0.5,0),(0.5,1,0),(1,1,0)])
-        self.draw_axes_from_matrix(self.Lidar_Position,  scale=1.5, colors=[(0,1,1),(1,0,1),(0.5,0.5,1)])
+        if self.use_live_data:
+            self.draw_axes_from_matrix(self.Word_Point,      scale=1,   coord_type="world")
+            self.draw_axes_from_matrix(self.Camera_Position, scale=1,   coord_type="camera")
+            self.draw_axes_from_matrix(self.Lidar_Position,  scale=1.5, coord_type="lidar")
+        elif self.show_global:
+            # 顯示每個 scan 的 coords（你已有這段在後面，但這裡也可以展示第一筆）
+            for scan, show in zip(self.global_scans, self.global_scans_show):
+                if not show or "coords" not in scan:
+                    continue
+                for coord_name, mat in scan["coords"].items():
+                    self.draw_axes_from_matrix(mat, scale=0.5, coord_type=coord_name)
+                break  # 只畫一筆代表性 scan
+        elif not self.use_live_data:
+            self.draw_axes_from_matrix(self.loaded_poses.get("world",  np.eye(4)), scale=1,   coord_type="world")
+            self.draw_axes_from_matrix(self.loaded_poses.get("camera", np.eye(4)), scale=1,   coord_type="camera")
+            self.draw_axes_from_matrix(self.loaded_poses.get("lidar",  np.eye(4)), scale=1.5, coord_type="lidar")
         glLineWidth(1.0)
+
 
         # -------------------------
         # 繪製靜態原點軸 (Origin XYZ)
@@ -974,11 +1026,15 @@ class PointCloudViewer:
         if self.show_global:
             glUniform1i(glGetUniformLocation(self.shader_program, "useUniformColor"), 1)
             glLineWidth(2.0)
-            for name, mat in global_coords.items():
-                # 只畫 marker_* 開頭的
-                if name.startswith("marker_"):
-                    # mat 已經是世界座標下的 marker 變換
-                    self.draw_axes_from_matrix(mat, scale=0.5)
+            if isinstance(GLOBAL_TO_MARKER, dict):  # 確保變數存在
+                for marker_id, mat in GLOBAL_TO_MARKER.items():
+                    coord_name = f"marker_{marker_id}"
+                    self.draw_axes_from_matrix(mat, scale=0.5, coord_type="world")
+            for scan, show in zip(self.global_scans, self.global_scans_show):
+                if not show or "coords" not in scan:
+                    continue
+                for coord_name, mat in scan["coords"].items():  # ⬅️ 這一層要縮排在裡面
+                    self.draw_axes_from_matrix(mat, scale=0.5, coord_type=coord_name)
             glLineWidth(1.0)
 
         imgui.new_frame()
@@ -1047,6 +1103,8 @@ class PointCloudViewer:
         imgui.push_item_width(120)
         _, self.retention_seconds = imgui.slider_float("Storage", self.retention_seconds, 1.0, 30.0)
         _, self.max_distance = imgui.slider_float("Max dist.", self.max_distance, 1.0, 20.0)
+        _, self.theta_x_deg = imgui.slider_float("Cam X Rotation", self.theta_x_deg, -90.0, 90.0)
+
         imgui.pop_item_width()
         imgui.spacing()
 
@@ -1080,20 +1138,22 @@ class PointCloudViewer:
             changed, new_val = imgui.checkbox("Show Global##toggle", self.show_global)
             if changed:
                 self.show_global = new_val
-            if imgui.button("Open Saved PLY##global"):
-                tk.Tk().withdraw()
-                path = filedialog.askopenfilename(
-                    filetypes=[("PLY files", "*.ply")],
-                    title="選擇要加入全域地圖的 PLY 檔案"
-                )
-                if path:
-                    self.load_ply_with_pose(path)
-                    with global_lock:
-                        global_size = 0
-                    global_coords.clear()
-                    add_to_global(self.loaded_points[:, :3].copy())
-                    for n, m in self.loaded_poses.items():
-                        add_global_coord(n, m)
+        if imgui.button("Open Saved PLY##global"):
+            tk.Tk().withdraw()
+            path = filedialog.askopenfilename(
+                filetypes=[("PLY files", "*.ply")],
+                title="選擇要加入全域地圖的 PLY 檔案"
+            )
+            if path:
+                self.load_ply_with_pose(path)
+                scan_name = f"scan_{len(self.global_scans)+1}"
+                self.global_scans.append({
+                    "name": scan_name,
+                    "points": self.loaded_points[:, :3].copy(),
+                    "coords": self.loaded_poses.copy()
+                })
+                self.global_scans_show.append(True)
+                print(f"✅ 加入 Global Map：{scan_name}，點數={self.loaded_points.shape[0]}")
             if imgui.button("Add to Global Map"):
                 scan_name = f"scan_{len(self.global_scans)+1}"
                 self.global_scans.append({
@@ -1119,48 +1179,49 @@ class PointCloudViewer:
                 self.pan_offset = np.array([0.0, 0.0, 0.0], np.float32)
                 self.zoom = 20.0
             imgui.separator()
-            # ---- 下拉式多選掃描列表 ----
-            imgui.text("Scans:")
-            # 組合預覽文字：已勾選的掃描名稱，用逗號分隔
-            preview = ", ".join(
-                scan["name"] for i,scan in enumerate(self.global_scans)
-                if self.global_scans_show[i]
-            ) or "Select Scans"
-            if imgui.begin_combo("##scan_combo", preview):
-                for idx, scan in enumerate(self.global_scans):
-                    sel = self.global_scans_show[idx]
-                    clicked, new_sel = imgui.selectable(scan["name"], sel)
-                    if clicked:
-                        self.global_scans_show[idx] = not sel
-                    if new_sel:
-                        imgui.set_item_default_focus()
-                imgui.end_combo()
+        # ---- 下拉式多選掃描列表 ----
+        imgui.text("Scans:")
+        # 組合預覽文字：已勾選的掃描名稱，用逗號分隔
+        preview = ", ".join(
+            scan["name"] for i,scan in enumerate(self.global_scans)
+            if self.global_scans_show[i]
+        ) or "Select Scans"
+        if imgui.begin_combo("##scan_combo", preview):
+            for idx, scan in enumerate(self.global_scans):
+                sel = self.global_scans_show[idx]
+                clicked, new_sel = imgui.selectable(scan["name"], sel)
+                if clicked:
+                    self.global_scans_show[idx] = not sel
+                if new_sel:
+                    imgui.set_item_default_focus()
+            imgui.end_combo()
 
-            # ---- 刪除單一掃描 ----
-            imgui.text("Delete Scan:")
-            # 預設第一筆或上次選擇
-            if not hasattr(self, "delete_idx"):
-                self.delete_idx = 0
-            current = (
-                self.global_scans[self.delete_idx]["name"]
-                if self.global_scans else ""
-            )
-            if imgui.begin_combo("##del_combo", current):
-                for idx, scan in enumerate(self.global_scans):
-                    sel = (idx == self.delete_idx)
-                    if imgui.selectable(scan["name"], sel)[0]:
-                        self.delete_idx = idx
-                imgui.end_combo()
-            imgui.same_line()
-            if imgui.button("Delete"):
-                if 0 <= self.delete_idx < len(self.global_scans):
-                    del self.global_scans[self.delete_idx]
-                    del self.global_scans_show[self.delete_idx]
-                    # 調整 delete_idx 不越界
-                    self.delete_idx = min(self.delete_idx, len(self.global_scans)-1)
-            imgui.separator()
+        # ---- 刪除單一掃描 ----
+        imgui.text("Delete Scan:")
+        # 預設第一筆或上次選擇
+        if not hasattr(self, "delete_idx"):
+            self.delete_idx = 0
+        current = (
+            self.global_scans[self.delete_idx]["name"]
+            if self.global_scans else ""
+        )
+        if imgui.begin_combo("##del_combo", current):
+            for idx, scan in enumerate(self.global_scans):
+                sel = (idx == self.delete_idx)
+                if imgui.selectable(scan["name"], sel)[0]:
+                    self.delete_idx = idx
+            imgui.end_combo()
+        imgui.same_line()
+        if imgui.button("Delete"):
+            if 0 <= self.delete_idx < len(self.global_scans):
+                del self.global_scans[self.delete_idx]
+                del self.global_scans_show[self.delete_idx]
+                # 調整 delete_idx 不越界
+                self.delete_idx = min(self.delete_idx, len(self.global_scans)-1)
 
-            imgui.text(f"Accumulated points: {global_size:,}")
+        imgui.separator()
+
+        imgui.text(f"Accumulated points: {global_size:,}")
 
         imgui.separator()
         imgui.text(f"FPS: {imgui.get_io().framerate:.1f}  |  pts: {pts_array.shape[0]:,}  |  Total: {total_pts:,}")
@@ -1193,6 +1254,7 @@ class PointCloudViewer:
             print(f"儲存點雲資料時發生錯誤: {e}")
 
     def save_live_to_ply(self):
+        Cam_T_Lidar = self.compute_cam_to_lidar()
         with self.points_lock:
             pts = self.ring_buffer.get_recent_points(self.retention_seconds)  # Nx3
         if pts.shape[0] == 0:
@@ -1242,18 +1304,26 @@ class PointCloudViewer:
         ).start()
 
     def save_global_to_ply(self):
-        # 1) 取出 global_pts
-        with global_lock:
-            pts = global_pts[:global_size].copy()
-        if pts.size == 0:
+        selected_pts = []
+        all_coords = {}
+
+        for scan, show in zip(self.global_scans, self.global_scans_show):
+            if show:
+                if "points" in scan:
+                    selected_pts.append(scan["points"])
+                if "coords" in scan:
+                    for name, mat in scan["coords"].items():
+                        all_coords[f"{scan['name']}_{name}"] = mat
+
+        if not selected_pts:
             print("Global Map 是空的，無點可存")
             return
 
-        # 2) 統一 timestamp (這裡我用當下時間)
-        stamps = np.full((pts.shape[0],1), time.time(), dtype=np.float32)
-        data4 = np.hstack((pts, stamps))  # shape=(N,4)
+        pts = np.vstack(selected_pts)
+        stamps = np.full((pts.shape[0], 1), time.time(), dtype=np.float32)
+        data4 = np.hstack((pts, stamps))
 
-        # 3) PLY header（加入所有坐標系 comment）
+        # PLY Header
         header_lines = [
             "ply",
             "format binary_little_endian 1.0",
@@ -1264,40 +1334,45 @@ class PointCloudViewer:
             "property float timestamp",
         ]
 
-        # helper：把一個 4x4 矩陣展開成多行 comment
         def matrix_to_comments(name, mat):
             flat = mat.flatten()
             return [f"comment {name}_{i} {v:.6f}" for i, v in enumerate(flat)]
 
-        # 把 global_coords 裡的每個坐標系都寫入
-        for name, mat in global_coords.items():
+        for name, mat in all_coords.items():
             header_lines += matrix_to_comments(name, mat)
 
         header_lines.append("end_header")
         header = "\n".join(header_lines) + "\n"
 
-        # 4) 檔名
         filename = os.path.join(
             "saved_ply",
             f"global_{time.strftime('%Y%m%d_%H%M%S')}.ply"
         )
 
-        # 5) 背景執行緒寫入
         threading.Thread(
             target=self.save_points_to_ply_binary_task,
             args=(data4, filename, header),
             daemon=True
         ).start()
-        print(f"開始將 Global Map (含所有坐標系) 寫入 {filename}…")
+
+        print(f"✅ 開始儲存 {len(data4)} 筆 Global 點雲資料，輸出到 {filename}")
+
 
 
  # -------------------------
 # 額外：繪製 ArUco、Camera、LiDAR 的動態坐標系（XYZ）
 # -------------------------
-    def draw_axes_from_matrix(self, matrix, scale=0.2, colors=None):
-        if colors is None:
-            colors = [(1, 0, 0), (0, 1, 0), (0, 0, 1)]  # 預設 RGB
+    def draw_axes_from_matrix(self, matrix, scale=0.2, coord_type=None):
+        # 定義各種坐標系對應的顏色（XYZ 軸）
+        color_map = {
+            "world":  [(1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)],  # 紅綠藍
+            "camera": [(1.0, 0.5, 0.0), (0.5, 1.0, 0.0), (1.0, 1.0, 0.0)],  # 橘黃亮黃
+            "lidar":  [(0.0, 1.0, 1.0), (1.0, 0.0, 1.0), (0.5, 0.5, 1.0)],  # 青紫藍
+            None:     [(1.0, 1.0, 1.0), (1.0, 1.0, 1.0), (1.0, 1.0, 1.0)]   # 白色 fallback
+        }
+        colors = color_map.get(coord_type, color_map[None])
 
+        # 產生 VAO 快取 key（matrix + scale）
         key = tuple(matrix.flatten()) + (scale,)
         vao, vertex_count = self._axis_vao_cache.get(key, (None, 0))
 
@@ -1328,14 +1403,17 @@ class PointCloudViewer:
         glBindVertexArray(vao)
         glLineWidth(3.0)
         glUniform1i(glGetUniformLocation(self.shader_program, "useUniformColor"), 1)
-        glUniform4f(glGetUniformLocation(self.shader_program, "uColor"), *colors[0], 1)
+
+        glUniform4f(glGetUniformLocation(self.shader_program, "uColor"), *colors[0], 1.0)
         glDrawArrays(GL_LINES, 0, 2)
-        glUniform4f(glGetUniformLocation(self.shader_program, "uColor"), *colors[1], 1)
+        glUniform4f(glGetUniformLocation(self.shader_program, "uColor"), *colors[1], 1.0)
         glDrawArrays(GL_LINES, 2, 2)
-        glUniform4f(glGetUniformLocation(self.shader_program, "uColor"), *colors[2], 1)
+        glUniform4f(glGetUniformLocation(self.shader_program, "uColor"), *colors[2], 1.0)
         glDrawArrays(GL_LINES, 4, 2)
+
         glBindVertexArray(0)
         glLineWidth(1.0)
+
 
 
     def load_ply_with_pose(self, filepath: str):

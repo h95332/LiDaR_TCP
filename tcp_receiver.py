@@ -43,7 +43,7 @@ class PointRingBuffer:
     def get_recent_points(self, retention_time):
         if self.size == 0:
             return np.empty((0, 3), dtype=np.float32)
-        now = time.time()
+        now = time.monotonic()
         cutoff = now - retention_time
 
         if self.size < self.max_points:
@@ -55,11 +55,11 @@ class PointRingBuffer:
         # 使用二分搜尋取得符合保留時間條件的點（只取 x,y,z）
         idx = np.searchsorted(data[:, 3], cutoff, side='left')
         valid = data[idx:, :3]
-        print(">>> [DEBUG] 現在時間:", time.time())
-        print(">>> [DEBUG] 資料 timestamp 前幾筆:", data[:5, 3])
-        print(">>> [DEBUG] retention_time 設定為:", retention_time)
-        print(">>> [DEBUG] cutoff 時間 = ", cutoff)
-        print(">>> [DEBUG] 通過條件的點數 = ", valid.shape[0])
+        # print(">>> [DEBUG] 現在時間:", time.time())
+        # print(">>> [DEBUG] 資料 timestamp 前幾筆:", data[:5, 3])
+        # print(">>> [DEBUG] retention_time 設定為:", retention_time)
+        # print(">>> [DEBUG] cutoff 時間 = ", cutoff)
+        # print(">>> [DEBUG] 通過條件的點數 = ", valid.shape[0])
         return valid.astype(np.float32)
     
 
