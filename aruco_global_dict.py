@@ -575,7 +575,7 @@ class PointCloudViewer:
             # —— 嘗試建立連線 —— #
             try:
                 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                sock.settimeout(5.0)  # 連線／send 最多等 5 秒
+                sock.settimeout(5.0)
                 sock.connect((host, port))
                 sock.settimeout(None)
                 print(f"TCP Sender: 已連線至 {host}:{port}")
@@ -584,50 +584,52 @@ class PointCloudViewer:
                 time.sleep(2)
                 continue
 
-            # —— 連線成功後進入傳送迴圈 —— #
             try:
                 while not stop_event.is_set():
-                    # 準備 coord 系列
-                    coord_system = {
-                        name: mat.tolist()
-                        for name, mat in global_coords.items()
-                        if name.startswith("marker_")
-                    }
-                    # ► 準備要送的點雲資料（Live / Global / File）
+                    # 預設 data4, coord_system
+                    data4 = np.empty((0,4), dtype=np.float32)
+                    coord_system = {}
+
+                    # —— Live 模式 —— #
                     if self.send_mode == 0:
-                        with self.points_lock:
-                            pts = self.ring_buffer.get_recent_points(self.retention_seconds)
-                        pts3, stamps = self.get_latest_live_points()  # stamps 是 (N,1)
+                        pts3, stamps = self.get_latest_live_points()
                         data4 = np.hstack((pts3, stamps))
                         coord_system = {
-                            "lidar":  self.Lidar_Position,
-                            "camera": self.Camera_Position,
-                            "world":  self.Word_Point,
+                            "world": self.Word_Point.tolist(),
+                            "camera": self.Camera_Position.tolist(),
+                            "lidar": self.Lidar_Position.tolist(),
                         }
+
+                    # —— Global 模式 —— #
                     elif self.send_mode == 1:
-                            selected_pts = []
-                            coord_system = {}
-                            # ✅ 加入 GLOBAL_TO_MARKER 中所有 marker 資訊
-                            for marker_id, mat in GLOBAL_TO_MARKER.items():
-                                coord_system[f"marker_{marker_id}"] = mat
-                            for scan, show in zip(self.global_scans, self.global_scans_show):
-                                if show and "points" in scan:
-                                    selected_pts.append(scan["points"])
-                                    if "coords" in scan:
-                                        for name, mat in scan["coords"].items():
-                                            # 👇 新增這段
-                                            if name in ["camera", "lidar", "world"]:
-                                                coord_system[name] = mat
-                                            coord_system[f"{scan['name']}_{name}"] = mat
+                        # collect all points
+                        selected_pts = [
+                            scan["points"]
+                            for scan, show in zip(self.global_scans, self.global_scans_show)
+                            if show and "points" in scan
+                        ]
+                        if selected_pts:
+                            pts = np.vstack(selected_pts)
+                            stamps = np.full((pts.shape[0],1), time.monotonic(), dtype=np.float32)
+                            data4 = np.hstack((pts, stamps))
 
+                        # 先把所有 markers 加進 coord_system
+                        coord_system = {
+                            f"marker_{mid}": mat.tolist()
+                            for mid, mat in GLOBAL_TO_MARKER.items()
+                        }
+                        # 再把每筆 scan 的三組 pose 加進 coord_system
+                        for scan, show in zip(self.global_scans, self.global_scans_show):
+                            if not show or "coords" not in scan:
+                                continue
+                            for name, mat in scan["coords"].items():
+                                coord_system[f"{scan['name']}_{name}"] = mat.tolist()
 
-                            if not selected_pts:
-                                data4 = np.empty((0, 4), dtype=np.float32)
-                            else:
-                                pts = np.vstack(selected_pts)
-                                stamps = np.full((pts.shape[0], 1), time.monotonic(), dtype=np.float32)
-                                data4 = np.hstack((pts, stamps))
-                    else:  # File 模式
+                        # DEBUG 印出一次
+                        print("[TCP Sender] sending coord_system keys:", list(coord_system.keys()))
+
+                    # —— File 模式 —— #
+                    elif self.send_mode == 2:
                         mask = np.logical_and(
                             self.loaded_points[:,3] >= self.file_time_start,
                             self.loaded_points[:,3] <= self.file_time_end
@@ -635,17 +637,16 @@ class PointCloudViewer:
                         pts = self.loaded_points[mask, :3].astype(np.float32)
                         stamps = np.full((pts.shape[0],1), time.monotonic(), dtype=np.float32)
                         data4 = np.hstack((pts, stamps))
-                        coord_system = self.loaded_poses.copy()
+                        coord_system = {
+                            k: v.tolist() for k, v in self.loaded_poses.items()
+                        }
 
-                    # 拆出 XYZ + timestamp bytes
+                    # 打包並傳送
                     points_bin = data4.astype(np.float32).tobytes()
                     coord_bin = json.dumps(coord_system, cls=NumpyEncoder).encode('utf-8')
-
-                    # Header：coord 長度 + points 長度
                     header = struct.pack('<II', len(coord_bin), len(points_bin))
-                    message = header + coord_bin + points_bin
+                    sock.sendall(header + coord_bin + points_bin)
 
-                    sock.sendall(message)
                     time.sleep(1)
 
             except Exception as e:

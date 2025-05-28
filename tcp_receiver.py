@@ -18,16 +18,18 @@ from imgui.integrations.glfw import GlfwRenderer
 class PointRingBuffer:
     def __init__(self, max_points):
         self.max_points = max_points
-        # 每筆資料包含 (x, y, z, timestamp)，預設使用 float64
-        self.buffer = np.zeros((max_points, 4), dtype=np.float64)
+        self.buffer = np.zeros((max_points, 4), dtype=np.float32)  # (x, y, z, timestamp)
         self.index = 0
         self.size = 0
+        self._linear_cache = None
+        self._dirty = False  # 是否有更新，需重建 linear 資料
 
     def add_points(self, new_points: np.ndarray):
         if new_points is None or new_points.size == 0:
             return
         if new_points.shape[1] != 4:
-            raise ValueError("新加入的點必須為 Nx4 陣列（x, y, z, timestamp）")
+            raise ValueError("新加入的點必須為 Nx4 陣列（x,y,z,timestamp）")
+
         n = new_points.shape[0]
         end_index = self.index + n
 
@@ -37,37 +39,40 @@ class PointRingBuffer:
             overflow = end_index - self.max_points
             self.buffer[self.index:] = new_points[:n - overflow]
             self.buffer[:overflow] = new_points[n - overflow:]
+
         self.index = (self.index + n) % self.max_points
         self.size = min(self.size + n, self.max_points)
+        self._dirty = True
 
-    def get_recent_points(self, retention_time):
+    def get_recent_points(self, retention_time, with_time=False):
         if self.size == 0:
-            return np.empty((0, 3), dtype=np.float32)
+            return np.empty((0, 4 if with_time else 3), dtype=np.float32)
+
         now = time.monotonic()
         cutoff = now - retention_time
 
-        if self.size < self.max_points:
-            data = self.buffer[:self.size]
-        else:
-            # 利用 np.roll 將環狀緩衝區卷成連續的陣列
-            data = np.roll(self.buffer, -self.index, axis=0)
+        # —— 線性化資料（有需要時才重建） —— #
+        if self._dirty:
+            if self.size < self.max_points:
+                self._linear_cache = self.buffer[:self.size]
+            else:
+                self._linear_cache = np.vstack((self.buffer[self.index:], self.buffer[:self.index]))
+            self._dirty = False
 
-        # 使用二分搜尋取得符合保留時間條件的點（只取 x,y,z）
+        data = self._linear_cache
         idx = np.searchsorted(data[:, 3], cutoff, side='left')
-        valid = data[idx:, :3]
-        # print(">>> [DEBUG] 現在時間:", time.time())
-        # print(">>> [DEBUG] 資料 timestamp 前幾筆:", data[:5, 3])
-        # print(">>> [DEBUG] retention_time 設定為:", retention_time)
-        # print(">>> [DEBUG] cutoff 時間 = ", cutoff)
-        # print(">>> [DEBUG] 通過條件的點數 = ", valid.shape[0])
-        return valid.astype(np.float32)
-    
+        valid = data[idx:]
 
+        return valid if with_time else valid[:, :3]
 
     def clear(self):
         self.buffer[:] = 0
         self.index = 0
         self.size = 0
+        self._dirty = True
+        self._linear_cache = None
+
+   
 
 # =============================================================================
 # Shader 工具函式
@@ -189,6 +194,7 @@ class TCPReceiver(threading.Thread):
                         break
                     try:
                         coord_sys = json.loads(coord_bytes.decode('utf-8'))
+                        # print("[TCP Receiver] RAW coord_sys keys:", list(coord_sys.keys()))
                     except Exception as e:
                         print(f"坐標系統資訊解碼錯誤: {e}")
                         continue
@@ -196,7 +202,7 @@ class TCPReceiver(threading.Thread):
                     pts_bytes = self._recvall(conn, pts_len)
                     if pts_bytes is None:
                         break
-                    pts4 = np.frombuffer(pts_bytes, dtype=np.float32).reshape(-1, 4).astype(np.float64)
+                    pts4 = np.frombuffer(pts_bytes, dtype=np.float32).reshape(-1, 4).astype(np.float32)
                     with self.lock:
                         self.ring_buffer.add_points(pts4)
 
@@ -252,11 +258,11 @@ class PointCloudViewer:
         self.retention_seconds = 5.0  
         self.pan_offset = np.array([0.0, 0.0, 0.0], dtype=np.float32)
 
-        self.ring_buffer = PointRingBuffer(max_points=10000000)
+        self.ring_buffer = PointRingBuffer(max_points=5000000)
         self.points_lock = threading.Lock()
 
         # 啟動 TCPReceiver，監聽 0.0.0.0:9000 接收點雲資料
-        self.remote_coordinate_system = None
+        self.remote_coordinate_system = {}
         self.tcp_receiver = TCPReceiver('0.0.0.0', 9000, self.ring_buffer, self.points_lock)
         self.tcp_receiver.viewer = self
         self.tcp_receiver.start()
@@ -266,7 +272,7 @@ class PointCloudViewer:
         self.init_imgui()
         self.init_shaders()
         self.init_buffers()
-        self.remote_coordinate_system = None  # 儲存接收到的 matrix (4x4)
+        
         self.tcp_receiver.viewer = self
 
 
@@ -290,6 +296,8 @@ class PointCloudViewer:
         self.shader_program = create_shader_program(vertex_shader_source, fragment_shader_source)
         self.mvp_loc = glGetUniformLocation(self.shader_program, "MVP")
         self.max_distance_loc = glGetUniformLocation(self.shader_program, "maxDistance")
+        self.use_uniform_color_loc = glGetUniformLocation(self.shader_program, "useUniformColor")
+        self.u_color_loc = glGetUniformLocation(self.shader_program, "uColor")
         self.max_distance = 5.0
 
     def init_buffers(self):
@@ -303,14 +311,37 @@ class PointCloudViewer:
         glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 0, None)
         glBindVertexArray(0)
 
-        # 建立格線
+        # 建立格線（純 NumPy 向量化）
         grid_size = 10
-        grid_lines = []
-        for i in range(-grid_size, grid_size + 1):
-            grid_lines.extend([-grid_size, i, 0.0, grid_size, i, 0.0])
-            grid_lines.extend([i, -grid_size, 0.0, i, grid_size, 0.0])
-        self.grid_vertices = np.array(grid_lines, dtype=np.float32)
-        self.grid_vertex_count = len(grid_lines) // 3
+        gs = np.arange(-grid_size, grid_size + 1, dtype=np.float32)    # [-10, …, 10]
+        zeros = np.zeros_like(gs)
+
+        # 水平線端點 h1→h2，垂直線端點 v1→v2
+        h1 = np.column_stack((-grid_size * np.ones_like(gs), gs, zeros))
+        h2 = np.column_stack(( grid_size * np.ones_like(gs), gs, zeros))
+        v1 = np.column_stack(( gs, -grid_size * np.ones_like(gs), zeros))
+        v2 = np.column_stack(( gs,  grid_size * np.ones_like(gs), zeros))
+
+        # 交錯排列成 (N*4,3)
+        grid_pts = np.empty((gs.size * 4, 3), dtype=np.float32)
+        grid_pts[0::4] = h1
+        grid_pts[1::4] = h2
+        grid_pts[2::4] = v1
+        grid_pts[3::4] = v2
+        # —— 產生並設定格線的 VAO/VBO —— #
+        self.grid_vao = glGenVertexArrays(1)
+        self.grid_vbo = glGenBuffers(1)
+        glBindVertexArray(self.grid_vao)
+        # 平坦化並上傳 GPU
+        self.grid_vertices = grid_pts.flatten()
+        self.grid_vertex_count = grid_pts.shape[0]
+
+        glBindBuffer(GL_ARRAY_BUFFER, self.grid_vbo)
+        glBufferData(GL_ARRAY_BUFFER,
+                    self.grid_vertices.nbytes,
+                    self.grid_vertices,
+                    GL_STATIC_DRAW)
+
         self.grid_vao = glGenVertexArrays(1)
         self.grid_vbo = glGenBuffers(1)
         glBindVertexArray(self.grid_vao)
@@ -331,6 +362,19 @@ class PointCloudViewer:
         glBindVertexArray(self.axes_vao)
         glBindBuffer(GL_ARRAY_BUFFER, self.axes_vbo)
         glBufferData(GL_ARRAY_BUFFER, axes_vertices.nbytes, axes_vertices, GL_STATIC_DRAW)
+        glEnableVertexAttribArray(0)
+        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 0, None)
+        glBindVertexArray(0)
+
+        # —— 動態座標軸（draw_axes_from_matrix 用）VAO/VBO —— #
+        # 1. 建立 VAO/VBO
+        self.frame_vao = glGenVertexArrays(1)
+        self.frame_vbo = glGenBuffers(1)
+
+        # 2. 初始化綁定並分配空間：6 點 × 3 float × 4 byte
+        glBindVertexArray(self.frame_vao)
+        glBindBuffer(GL_ARRAY_BUFFER, self.frame_vbo)
+        glBufferData(GL_ARRAY_BUFFER, 6 * 3 * 4, None, GL_DYNAMIC_DRAW)
         glEnableVertexAttribArray(0)
         glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 0, None)
         glBindVertexArray(0)
@@ -414,26 +458,22 @@ class PointCloudViewer:
             *origin, *z_axis
         ], dtype=np.float32)
 
-        vao = glGenVertexArrays(1)
-        vbo = glGenBuffers(1)
-        glBindVertexArray(vao)
-        glBindBuffer(GL_ARRAY_BUFFER, vbo)
-        glBufferData(GL_ARRAY_BUFFER, vertices.nbytes, vertices, GL_STATIC_DRAW)
-        glEnableVertexAttribArray(0)
-        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 0, None)
+        # 直接更新預先建立的 frame_vbo
+        glBindBuffer(GL_ARRAY_BUFFER, self.frame_vbo)
+        glBufferSubData(GL_ARRAY_BUFFER, 0, vertices.nbytes, vertices)
+        # 綁定並畫出
+        glBindVertexArray(self.frame_vao)        
 
         glLineWidth(3.0)
-        glUniform1i(glGetUniformLocation(self.shader_program, "useUniformColor"), 1)
-        glUniform4f(glGetUniformLocation(self.shader_program, "uColor"), *colors[0], 1)
+        glUniform1i(self.use_uniform_color_loc, 1)
+        glUniform4f(self.u_color_loc, *colors[0], 1)
         glDrawArrays(GL_LINES, 0, 2)
-        glUniform4f(glGetUniformLocation(self.shader_program, "uColor"), *colors[1], 1)
+        glUniform4f(self.u_color_loc, *colors[1], 1)
         glDrawArrays(GL_LINES, 2, 2)
-        glUniform4f(glGetUniformLocation(self.shader_program, "uColor"), *colors[2], 1)
+        glUniform4f(self.u_color_loc, *colors[2], 1)
         glDrawArrays(GL_LINES, 4, 2)
 
         glBindVertexArray(0)
-        glDeleteVertexArrays(1, [vao])
-        glDeleteBuffers(1, [vbo])
         glLineWidth(1.0)
     
     def restart_tcp_receiver(self, host="0.0.0.0", port=9000):
@@ -481,7 +521,10 @@ class PointCloudViewer:
         if num_points > 0:
             pts_array = np.ascontiguousarray(pts_array, dtype=np.float32)
             glBindBuffer(GL_ARRAY_BUFFER, self.point_vbo)
-            glBufferSubData(GL_ARRAY_BUFFER, 0, pts_array.nbytes, pts_array)
+            ptr = glMapBufferRange(GL_ARRAY_BUFFER, 0, pts_array.nbytes,
+                                GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_BUFFER_BIT)
+            ctypes.memmove(ptr, pts_array.ctypes.data, pts_array.nbytes)
+            glUnmapBuffer(GL_ARRAY_BUFFER)
             glBindVertexArray(self.point_vao)
             glDrawArrays(GL_POINTS, 0, min(num_points, self.max_points))
             glBindVertexArray(0)
@@ -489,14 +532,24 @@ class PointCloudViewer:
         if self.remote_coordinate_system:
             with self.coord_lock:
                 for name, matrix in self.remote_coordinate_system.items():
-                    if name == "lidar":
-                        self.draw_axes_from_matrix(matrix, scale=1.5, colors=[(0, 1, 1), (1, 0, 1), (0.5, 0.5, 1)])  # 青紫藍
-                    elif name == "camera":
-                        self.draw_axes_from_matrix(matrix, scale=1.0, colors=[(1, 0.5, 0), (0.5, 1, 0), (1, 1, 0)])  # 橘綠黃
-                    elif name == "world":
-                        self.draw_axes_from_matrix(matrix, scale=1.0, colors=[(1, 0, 0), (0, 1, 0), (0, 0, 1)])  # 紅綠藍
+                # scan_1_lidar, scan_2_lidar, … 都會被此命中
+                    if name.endswith("_lidar"):
+                        self.draw_axes_from_matrix(matrix,
+                            scale=1.5,
+                            colors=[(0,1,1),(1,0,1),(0.5,0.5,1)])
+                    elif name.endswith("_camera"):
+                        self.draw_axes_from_matrix(matrix,
+                            scale=1.0,
+                            colors=[(1,0.5,0),(0.5,1,0),(1,1,0)])
+                    elif name.endswith("_world"):
+                        self.draw_axes_from_matrix(matrix,
+                            scale=1.0,
+                            colors=[(1,0,0),(0,1,0),(0,0,1)])
                     elif name.startswith("marker_"):
-                        self.draw_axes_from_matrix(matrix, scale=0.6, colors=[(0.6, 0.6, 0.6), (0.3, 0.3, 0.3), (0.2, 0.2, 0.2)])  # 淺灰系
+                        self.draw_axes_from_matrix(matrix,
+                            scale=0.6,
+                            colors=[(1.0,0.0,0.0),(0.0,1.0,0.0),(0.0,0.0,1.0)])
+                
 
 
 
@@ -530,6 +583,7 @@ class PointCloudViewer:
             self.rotation_y = 0.0
             self.pan_offset = np.array([0.0, 0.0, 0.0], dtype=np.float32)
             self.zoom = 20.0
+
         if imgui.button("Restart TCP Receiver"):
             self.restart_tcp_receiver()
         if imgui.button("Exit Application"):
@@ -537,6 +591,7 @@ class PointCloudViewer:
             
         imgui.text(f"Current points: {pts_array.shape[0]}")
         imgui.text(f"Total stored: {total_pts}")
+        imgui.text(f"ImGui FPS: {imgui.get_io().framerate:.1f}")
         imgui.end()
         imgui.render()
         self.impl.render(imgui.get_draw_data())
