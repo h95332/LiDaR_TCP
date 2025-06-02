@@ -54,7 +54,6 @@ global_pts  = np.zeros((GLOBAL_MAX_POINTS, 3), np.float32)
 global_size = 0
 global_lock = threading.Lock()
 # 全域座標系緩存：key → 4×4 矩陣
-global_coords = {}
 
 global_map = {}         # { aruco_id: {"points": (N,3), "pose": {...}} }
 global_map_show = {}    # { aruco_id: bool }
@@ -70,10 +69,6 @@ def remove_from_global_map(aruco_id):
         global_map.pop(aruco_id, None)
         global_map_show.pop(aruco_id, None)
 
-
-def add_global_coord(name: str, mat: np.ndarray):
-    """把 name:4×4 矩陣 加到全域座標系，重複 name 會直接覆蓋"""
-    global_coords[name] = mat.copy()
 
 
 def add_to_global(new_pts: np.ndarray):
@@ -168,22 +163,6 @@ def detect_aruco_thread(camera_id=0, dictionary=aruco.DICT_4X4_250):
 # =============================================================================
 # 點雲轉換函數：利用 4x4 齊次變換矩陣轉換 (N, 3) 點雲資料
 # =============================================================================
-def transform_point_cloud_(points, Lidar_T_Aruco):
-    """
-    參數:
-      points (np.ndarray): (N, 3) 點雲資料
-      transform_matrix (np.ndarray): 4x4 齊次變換矩陣
-    回傳:
-      轉換後的 (N, 3) 點雲資料
-    """
-    if points.size == 0:
-        return points
-    ones = np.ones((points.shape[0], 1), dtype=points.dtype)
-    points_hom = np.hstack((points, ones))
-    arTlidar = np.linalg.inv(Lidar_T_Aruco) #  # ArUco 到 LiDAR 的變換矩陣
-    transformed = (arTlidar @ points_hom.T).T
-    
-    return transformed[:, :3]
 
 def transform_point_cloud(points, Lidar_T_Aruco, device='cuda'):
     """
@@ -1555,42 +1534,6 @@ class ArUcoTransformReceiver(threading.Thread):
                 print(f"❌ 解析 ArUco UDP 失敗: {e}")
 
 
-def gstreamer_receiver_thread(stop_event=None):
-    gst_str = (
-        'udpsrc port=5000 caps="application/x-rtp, media=video, '
-        'clock-rate=90000, encoding-name=H264" ! '
-        'rtph264depay ! avdec_h264 ! videoconvert ! appsink drop=1 sync=false'
-    )
-
-    cap = cv2.VideoCapture(gst_str, cv2.CAP_GSTREAMER)
-    if not cap.isOpened():
-        print("❌ 無法開啟 GStreamer 視訊串流")
-        return
-
-    print("✅ 開始接收 GStreamer 串流（按下 Q 或 ESC 離開）")
-    
-    try:
-        while stop_event is None or not stop_event.is_set():
-            ret, frame = cap.read()
-            if not ret:
-                print("⚠️ 無法讀取串流影像")
-                continue
-
-            # 可根據需要縮放顯示影像
-            # frame = cv2.resize(frame, (640, 480))
-            cv2.imshow("Camera Stream", frame)
-
-            key = cv2.waitKey(1)
-            if key == 27 or key == ord('q'):  # ESC 或 q 鍵
-                print("🛑 使用者中止串流")
-                break
-    except Exception as e:
-        print(f"❌ 發生例外錯誤：{e}")
-    finally:
-        cap.release()
-        cv2.destroyAllWindows()
-
-
 
 # =============================================================================
 # 程式進入點：
@@ -1602,7 +1545,6 @@ if __name__ == '__main__':
     # ✅ 啟動遠端 UDP ArUco 接收線程))
     aruco_recv_thread = ArUcoTransformReceiver(udp_port=9002)
     aruco_recv_thread.start()
-    threading.Thread(target=gstreamer_receiver_thread, daemon=True).start()
     live_view   = PointCloudViewer()
 
     while not glfw.window_should_close(live_view.window):

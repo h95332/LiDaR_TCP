@@ -275,6 +275,11 @@ class PointCloudViewer:
         
         self.tcp_receiver.viewer = self
 
+        self._view_dirty = True
+        self._view = None
+        self._model = None
+        self._mvp = None
+
 
     def init_glfw(self):
         if not glfw.init():
@@ -398,13 +403,23 @@ class PointCloudViewer:
             xpos, ypos = glfw.get_cursor_pos(self.window)
             last_x, last_y = self.last_cursor_pos
             sensitivity = 0.005
-            self.rotation_y += (xpos - last_x) * sensitivity
-            self.rotation_x += (ypos - last_y) * sensitivity
+            new_ry = self.rotation_y + (xpos - last_x) * sensitivity
+            new_rx = self.rotation_x + (ypos - last_y) * sensitivity
+            # 只有「值真的改變」才設定 Dirty
+            if new_ry != self.rotation_y or new_rx != self.rotation_x:
+                self.rotation_y = new_ry
+                self.rotation_x = new_rx
+                self._view_dirty = True
             self.last_cursor_pos = (xpos, ypos)
 
     def handle_keyboard_input(self):
         rotation_speed = 0.01
         pan_step = 0.1
+        # 先把「變更前」的參數備份
+        old_rx, old_ry = self.rotation_x, self.rotation_y
+        old_zoom = self.zoom
+        old_pan = self.pan_offset.copy()
+
         if glfw.get_key(self.window, glfw.KEY_LEFT) == glfw.PRESS:
             self.rotation_y -= rotation_speed
         if glfw.get_key(self.window, glfw.KEY_RIGHT) == glfw.PRESS:
@@ -431,11 +446,21 @@ class PointCloudViewer:
         if glfw.get_key(self.window, glfw.KEY_PAGE_DOWN) == glfw.PRESS:
             self.zoom += zoom_step
 
+        # 若任一參數跟舊值不同，就標記 Dirty
+        if (self.rotation_x != old_rx or
+            self.rotation_y != old_ry or
+            self.zoom       != old_zoom or
+            not np.allclose(self.pan_offset, old_pan)):
+            self._view_dirty = True
+
     def handle_scroll_input(self):
         io = imgui.get_io()
         if io.mouse_wheel != 0.0:
+            old_zoom = self.zoom
             self.zoom = max(self.zoom - io.mouse_wheel * 1.0, 0.1)
             io.mouse_wheel = 0.0
+            if self.zoom != old_zoom:
+                self._view_dirty = True
 
     def update(self):
         self.handle_keyboard_input()
@@ -494,26 +519,40 @@ class PointCloudViewer:
     def render(self):
         glClearColor(0.2, 0.2, 0.2, 1.0)
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
-        base_eye = np.array([0.0, -self.zoom, 5.0], dtype=np.float32)
-        base_target = np.array([0.0, 0.0, 0.0], dtype=np.float32)
-        eye = base_eye + self.pan_offset
-        target = base_target + self.pan_offset
-        view = pyrr.matrix44.create_look_at(eye, target, np.array([0.0, 1.0, 0.0], dtype=np.float32))
-        pitch = pyrr.matrix44.create_from_x_rotation(self.rotation_x)
-        yaw = pyrr.matrix44.create_from_z_rotation(self.rotation_y)
-        model = pyrr.matrix44.multiply(yaw, pitch)
-        # flip = pyrr.matrix44.create_from_x_rotation(np.pi)
-        # model = pyrr.matrix44.multiply(model, flip)
-        MVP = pyrr.matrix44.multiply(model, view)
-        MVP = pyrr.matrix44.multiply(MVP, self.projection)
-        self.last_model, self.last_view, self.last_projection = model, view, self.projection
+
+        # ────── 只有在 Dirty 時候才計算一次「View / Model / MVP」───
+        if self._view_dirty:
+            base_eye = np.array([0.0, -self.zoom, 5.0], dtype=np.float32)
+            base_target = np.array([0.0, 0.0, 0.0], dtype=np.float32)
+            eye = base_eye + self.pan_offset
+            target = base_target + self.pan_offset
+            self._view = pyrr.matrix44.create_look_at(
+                eye, target, np.array([0.0, 1.0, 0.0], dtype=np.float32))
+
+            # Model = 先繞 Z，再繞 X（保持跟原邏輯一致）
+            yaw = pyrr.matrix44.create_from_z_rotation(self.rotation_y)
+            pitch = pyrr.matrix44.create_from_x_rotation(self.rotation_x)
+            self._model = pyrr.matrix44.multiply(yaw, pitch)
+
+            # MVP = Model × View × Projection
+            self._mvp = pyrr.matrix44.multiply(self._model, self._view)
+            self._mvp = pyrr.matrix44.multiply(self._mvp, self.projection)
+
+            self._view_dirty = False
+
+        MVP = self._mvp
+
+        # （若你後面有用到 last_model/last_view/last_projection，可一併更新：
+        self.last_model = self._model
+        self.last_view = self._view
+        self.last_projection = self.projection
 
         glUseProgram(self.shader_program)
         glUniformMatrix4fv(self.mvp_loc, 1, GL_FALSE, MVP)
         glUniform1f(self.max_distance_loc, self.max_distance)
 
         # 繪製點雲
-        glUniform1i(glGetUniformLocation(self.shader_program, "useUniformColor"), 0)
+        glUniform1i(self.use_uniform_color_loc, 0)
         with self.points_lock:
             pts_array = self.ring_buffer.get_recent_points(self.retention_seconds)
             total_pts = self.ring_buffer.size
@@ -554,19 +593,19 @@ class PointCloudViewer:
 
 
         # 繪製格線
-        glUniform1i(glGetUniformLocation(self.shader_program, "useUniformColor"), 1)
+        glUniform1i(self.use_uniform_color_loc, 1)
         glBindVertexArray(self.grid_vao)
-        glUniform4f(glGetUniformLocation(self.shader_program, "uColor"), 0.7, 0.7, 0.7, 1.0)
+        glUniform4f(self.u_color_loc, 0.7, 0.7, 0.7, 1.0)
         glDrawArrays(GL_LINES, 0, self.grid_vertex_count)
         glBindVertexArray(0)
 
         # 繪製 XYZ 軸線
         glBindVertexArray(self.axes_vao)
-        glUniform4f(glGetUniformLocation(self.shader_program, "uColor"), 1.0, 0.0, 0.0, 1.0)
+        glUniform4f(self.u_color_loc, 1.0, 0.0, 0.0, 1.0)
         glDrawArrays(GL_LINES, 0, 2)
-        glUniform4f(glGetUniformLocation(self.shader_program, "uColor"), 0.0, 1.0, 0.0, 1.0)
+        glUniform4f(self.u_color_loc, 0.0, 1.0, 0.0, 1.0)
         glDrawArrays(GL_LINES, 2, 2)
-        glUniform4f(glGetUniformLocation(self.shader_program, "uColor"), 0.0, 0.0, 1.0, 1.0)
+        glUniform4f(self.u_color_loc, 0.0, 0.0, 1.0, 1.0)
         glDrawArrays(GL_LINES, 4, 2)
         glBindVertexArray(0)
 
